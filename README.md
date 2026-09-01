@@ -39,4 +39,4 @@ zig fmt --check .   # verify, non-zero exit on diff (used in CI)
 
 ## License
 
-Not yet chosen. Add a `LICENSE` file and list it in `build.zig.zon`'s `.paths`.
+[MIT](LICENSE) © Wesley Cremonini
