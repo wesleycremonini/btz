@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: MIT
-
 const std = @import("std");
 const Io = std.Io;
+
+const seeds = @import("seeds.zig");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -11,11 +11,17 @@ pub fn main(init: std.process.Init) !void {
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
 
-    try stdout.print("Hello, world!\n", .{});
+    try stdout.print("btc-crawler: {d} mainnet DNS seeds (p2p port {d})\n", .{
+        seeds.mainnet_dns_seeds.len,
+        seeds.mainnet_port,
+    });
+    for (seeds.mainnet_dns_seeds) |s| {
+        try stdout.print("  {s}\n", .{s.host});
+    }
 
     try stdout.flush();
 }
 
-test "hello" {
-    try std.testing.expect(std.mem.eql(u8, "Hello, world!", "Hello, world!"));
+test {
+    _ = @import("seeds.zig");
 }
