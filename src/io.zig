@@ -20,9 +20,8 @@ comptime {
 pub const IO = struct {
     ring: linux.IoUring,
 
-    /// `entries` is the ring depth; it must be a power of two. A handshake keeps
-    /// at most two SQEs in flight (an I/O op plus the deadline timer), so the
-    /// default caller value is small.
+    /// `entries` is the ring depth; it must be a power of two. The caller sizes
+    /// it for its whole workload: every SQE that can sit unsubmitted at once.
     pub fn init(entries: u16) !IO {
         assert(std.math.isPowerOfTwo(entries));
         return .{ .ring = try linux.IoUring.init(entries, 0) };
@@ -59,11 +58,29 @@ pub const IO = struct {
         _ = try io.ring.timeout(user_data, deadline, 0, 0);
     }
 
-    /// Submit every queued SQE and return the next completion, blocking until
-    /// one is available.
-    pub fn next_completion(io: *IO) !linux.io_uring_cqe {
+    /// Cancel a pending `prep_timeout` identified by `target_user_data`. Both the
+    /// timer and this removal complete with their own CQE.
+    pub fn prep_timeout_remove(io: *IO, user_data: u64, target_user_data: u64) !void {
+        assert(user_data != 0);
+        _ = try io.ring.timeout_remove(user_data, target_user_data, 0);
+    }
+
+    /// Cancel any pending op identified by `target_user_data`. Both the target
+    /// and this cancellation complete with their own CQE.
+    pub fn prep_cancel(io: *IO, user_data: u64, target_user_data: u64) !void {
+        assert(user_data != 0);
+        _ = try io.ring.cancel(user_data, target_user_data, 0);
+    }
+
+    /// Submit every queued SQE, block until at least one completion is ready,
+    /// then copy every ready completion into `cqes`. Returns the count (>= 1).
+    pub fn submit_and_reap(io: *IO, cqes: []linux.io_uring_cqe) !usize {
+        assert(cqes.len > 0);
         _ = try io.ring.submit_and_wait(1);
-        return io.ring.copy_cqe();
+        const count = try io.ring.copy_cqes(cqes, 0);
+        assert(count >= 1);
+        assert(count <= cqes.len);
+        return count;
     }
 };
 

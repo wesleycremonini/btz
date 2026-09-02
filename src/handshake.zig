@@ -1,10 +1,13 @@
 //! Bitcoin P2P version/verack handshake, driven by the io_uring event loop.
 //!
-//! `connect` opens a socket, then runs a small state machine off `IO`
-//! completions: connect -> send our `version` -> receive the peer's `version`
-//! (reply `verack`) and `verack` -> done. It writes what the peer advertised
-//! into a caller-owned `PeerInfo`. Nothing is allocated: the send frame and the
-//! receive buffer live in the `Handshake` state struct.
+//! `connect_all` runs many handshakes at once on one shared ring: each is a
+//! `Handshake` slot whose state machine steps off `IO` completions — connect ->
+//! send our `version` -> receive the peer's `version` (reply `verack`) and
+//! `verack` -> done. Every SQE carries a pointer to one of the slot's
+//! `Completion`s as its `user_data`, so a CQE names both the handshake and which
+//! op finished; a slot stays alive until its outstanding completions drain, so
+//! nothing needs a synchronous ring scrub between handshakes. Nothing is
+//! allocated: the pool, the per-slot buffers, and the results are caller-owned.
 //!
 //! The wire format is a 24-byte header (magic, 12-byte command, payload length,
 //! truncated double-SHA256 checksum) followed by the payload.
@@ -55,14 +58,19 @@ const recv_buffer_len = 4 * 1024;
 /// Send buffer: one framed message at a time (our `version` is the largest).
 const frame_buffer_len = header_len + version_payload_max;
 
-/// Upper bound on completions processed during one handshake. connect + our
-/// version send + a handful of recvs + our verack send + the peer's trailing
-/// messages fit comfortably; this only bounds a pathological peer.
+/// Upper bound on completions one handshake may process: connect + our version
+/// send + a handful of recvs + our verack send + the peer's trailing messages
+/// fit comfortably. Only a pathological peer reaches this before the deadline.
 const completions_max = 64;
 
-// `user_data` tags distinguishing the two SQEs a handshake keeps in flight.
-const user_data_io: u64 = 1;
-const user_data_timeout: u64 = 2;
+/// Per-handshake SQE identities. Each is a distinct `user_data` (a pointer into
+/// `Handshake.completions`) so a CQE names both the handshake and which of its
+/// SQEs completed: the in-flight I/O op, the deadline timer, and the
+/// cancel/remove op that retires whichever of those outlives the handshake.
+const completion_io = 0;
+const completion_timeout = 1;
+const completion_cancel = 2;
+const completion_count = 3;
 
 comptime {
     assert(header_len == 24);
@@ -73,9 +81,7 @@ comptime {
     assert(version_payload_max <= message_payload_max);
     assert(recv_buffer_len >= header_len + version_payload_max);
     assert(frame_buffer_len >= header_len + version_payload_max);
-    assert(user_data_io != 0);
-    assert(user_data_timeout != 0);
-    assert(user_data_io != user_data_timeout);
+    assert(completion_count == 3);
 }
 
 pub const Options = struct {
@@ -91,7 +97,7 @@ pub const Options = struct {
     timeout_ns: u63 = 10 * std.time.ns_per_s,
 };
 
-/// What the peer advertised in its own `version`. Filled in place by `connect`.
+/// What the peer advertised in its own `version`. Filled in by the handshake.
 pub const PeerInfo = struct {
     protocol_version: i32,
     services: u64,
@@ -105,7 +111,7 @@ pub const PeerInfo = struct {
     }
 };
 
-pub const HandshakeError = error{
+pub const DialError = error{
     /// A message did not begin with the expected network magic.
     MagicMismatch,
     /// The peer's `version` checksum did not match its payload.
@@ -118,36 +124,175 @@ pub const HandshakeError = error{
     EndOfStream,
     /// The handshake did not finish within `Options.timeout_ns`.
     Timeout,
-    /// `completions_max` completions passed without finishing (hostile peer).
+    /// `completions_max` completions passed without the handshake finishing.
     TooManyCompletions,
+    /// The connect / send / recv SQE failed at the transport layer.
+    ConnectionRefused,
+    ConnectionResetByPeer,
+    NetworkUnreachable,
+    HostUnreachable,
+    /// The kernel cancelled the operation.
+    Canceled,
+    /// The socket could not be created or started for this address.
+    SocketUnavailable,
+    /// The address was never dialed: `target` was reached, or the run ended.
+    Skipped,
+    /// An unclassified io_uring failure; see the log.
+    Unexpected,
 };
 
-/// Open a socket to `address`, run the handshake on `io`, and write the peer's
-/// advertised details into `peer`. `address` must already be resolved.
-pub fn connect(peer: *PeerInfo, io: *io_uring.IO, address: net.IpAddress, options: Options) !void {
+/// Outcome of dialing one address. `peer` is meaningful only when `outcome` is
+/// not an error.
+pub const Result = struct {
+    outcome: DialError!void,
+    peer: PeerInfo,
+};
+
+/// CQEs `connect_all` copies out of the ring per loop iteration.
+const reap_batch = 32;
+
+/// Smallest shared-ring SQ depth `connect_all` is safe to run on: every SQE it
+/// can queue between two submits — one new I/O op and one cancel per reaped CQE,
+/// plus the initial timer + connect for every pool slot.
+pub fn min_ring_entries(pool_slots: usize) usize {
+    return 2 * reap_batch + completion_count * pool_slots;
+}
+
+/// Handshake every address in `addresses`, keeping up to `slots.len` in flight
+/// at once on the shared `io` ring, and stop starting new ones once `target`
+/// have succeeded. `results` is filled one-to-one with `addresses`; an address
+/// never dialed keeps its `error.Skipped` outcome. `slots` and `results` are
+/// caller-owned; nothing is allocated.
+pub fn connect_all(
+    io: *io_uring.IO,
+    addresses: []const net.IpAddress,
+    slots: []Handshake,
+    results: []Result,
+    target: u32,
+    options: Options,
+) void {
+    assert(addresses.len == results.len);
+    assert(slots.len >= 1);
+    assert(target >= 1);
     assert(options.magic != 0);
     assert(options.user_agent.len > 0);
     assert(options.user_agent.len <= max_user_agent_len);
     assert(options.timeout_ns > 0);
 
-    const fd = try io_uring.open_socket(address);
-    defer io_uring.close_socket(fd);
+    for (results) |*result| result.* = .{ .outcome = error.Skipped, .peer = undefined };
+    for (slots) |*slot| slot.status = .idle;
 
-    var handshake: Handshake = undefined;
-    try handshake.init(peer, io, fd, address, options);
-    try handshake.run();
+    var next: u32 = 0; // index of the next address to dial
+    var succeeded: u32 = 0; // handshakes completed OK so far
+    for (slots) |*slot| fill_slot(io, slot, addresses, results, &next, succeeded, target, options);
+
+    var cqes: [reap_batch]linux.io_uring_cqe = undefined;
+    while (any_busy(slots)) {
+        const count = io.submit_and_reap(&cqes) catch |err| {
+            log.err("io_uring reap failed: {t}; {d} handshake(s) abandoned", .{ err, busy_count(slots) });
+            return;
+        };
+        for (cqes[0..count]) |cqe| {
+            const completion: *Completion = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
+            const slot = completion.handshake;
+            slot.on_completion(completion.kind, cqe);
+            if (slot.status != .settled) continue;
+
+            io_uring.close_socket(slot.fd);
+            results[slot.result_index] = .{ .outcome = slot.outcome, .peer = slot.peer };
+            if (slot.outcome) |_| {
+                succeeded += 1;
+            } else |_| {}
+            slot.status = .idle;
+            fill_slot(io, slot, addresses, results, &next, succeeded, target, options);
+        }
+    }
 }
 
-const Handshake = struct {
+fn any_busy(slots: []const Handshake) bool {
+    for (slots) |*slot| {
+        if (slot.status == .dialing or slot.status == .winding) return true;
+    }
+    return false;
+}
+
+fn busy_count(slots: []const Handshake) u32 {
+    var n: u32 = 0;
+    for (slots) |*slot| {
+        if (slot.status == .dialing or slot.status == .winding) n += 1;
+    }
+    return n;
+}
+
+/// Take addresses off the front of the queue until one handshake starts on
+/// `slot`, or there is nothing left to dial (`target` reached or list
+/// exhausted), leaving the slot `.idle`. A socket that will not open or start is
+/// recorded straight into `results` and the next address tried.
+fn fill_slot(
+    io: *io_uring.IO,
+    slot: *Handshake,
+    addresses: []const net.IpAddress,
+    results: []Result,
+    next: *u32,
+    succeeded: u32,
+    target: u32,
+    options: Options,
+) void {
+    assert(slot.status == .idle);
+    while (succeeded < target and next.* < addresses.len) {
+        const index = next.*;
+        next.* += 1;
+        const address = addresses[index];
+
+        const fd = io_uring.open_socket(address) catch |err| {
+            log.warn("open socket for {f}: {t}", .{ address, err });
+            results[index] = .{ .outcome = error.SocketUnavailable, .peer = undefined };
+            continue;
+        };
+        slot.start(io, fd, address, index, options) catch |err| {
+            log.warn("start handshake with {f}: {t}", .{ address, err });
+            io_uring.close_socket(fd);
+            results[index] = .{ .outcome = error.SocketUnavailable, .peer = undefined };
+            continue;
+        };
+        return;
+    }
+}
+
+const Completion = struct {
+    handshake: *Handshake,
+    kind: Kind,
+
+    const Kind = enum { io, timeout, cancel };
+};
+
+pub const Handshake = struct {
     io: *io_uring.IO,
     fd: linux.fd_t,
     options: Options,
     address: net.IpAddress,
-    peer: *PeerInfo,
 
-    /// Stable storage the connect SQE points at.
+    /// Which `results` entry this slot fills once it settles.
+    result_index: u32,
+    outcome: DialError!void,
+    peer: PeerInfo,
+
+    /// One stable `user_data` identity per SQE kind, each pointing back here so
+    /// a CQE names both the handshake and which SQE completed. The slot must not
+    /// move while any completion is outstanding.
+    completions: [completion_count]Completion,
+    /// SQEs submitted for this slot and not yet reaped. The slot is done only
+    /// once this reaches zero, so a cancelled deadline timer keeps the slot
+    /// alive until its `-ECANCELED` CQE is drained.
+    in_flight: u32,
+    /// CQEs dispatched to this slot, bounded by `completions_max`.
+    seen: u32,
+
+    status: Status,
+    phase: Phase,
+
+    /// Stable storage the connect / timeout SQEs point at.
     sockaddr: io_uring.SockAddr,
-    /// Stable storage the timeout SQE points at.
     deadline: linux.kernel_timespec,
 
     send_buffer: [frame_buffer_len]u8,
@@ -159,26 +304,47 @@ const Handshake = struct {
 
     version_received: bool,
     verack_received: bool,
-    phase: Phase,
 
+    /// Slot lifecycle, distinct from `Phase`:
+    /// - `idle`    unused, ready for `fill_slot`
+    /// - `dialing` handshake running, outcome not yet known
+    /// - `winding` outcome decided; still draining the cancelled SQE(s)
+    /// - `settled` `in_flight == 0`, `outcome` / `peer` final, ready to recycle
+    const Status = enum { idle, dialing, winding, settled };
     const Phase = enum { connecting, sending, receiving, complete };
     const PumpResult = enum { awaiting_more, send_verack, complete };
+    const ArmOp = enum { timeout, connect, send, recv };
 
-    fn init(
-        handshake: *Handshake,
-        peer: *PeerInfo,
+    fn start(
+        slot: *Handshake,
         io: *io_uring.IO,
         fd: linux.fd_t,
         address: net.IpAddress,
+        result_index: u32,
         options: Options,
-    ) !void {
-        handshake.* = .{
+    ) io_uring.SockAddr.FromError!void {
+        assert(slot.status == .idle);
+        assert(options.magic != 0);
+
+        const sockaddr = try io_uring.SockAddr.from(address);
+        slot.* = .{
             .io = io,
             .fd = fd,
             .options = options,
             .address = address,
-            .peer = peer,
-            .sockaddr = try io_uring.SockAddr.from(address),
+            .result_index = result_index,
+            .outcome = {},
+            .peer = undefined,
+            .completions = .{
+                .{ .handshake = slot, .kind = .io },
+                .{ .handshake = slot, .kind = .timeout },
+                .{ .handshake = slot, .kind = .cancel },
+            },
+            .in_flight = 0,
+            .seen = 0,
+            .status = .dialing,
+            .phase = .connecting,
+            .sockaddr = sockaddr,
             .deadline = .{
                 .sec = @intCast(options.timeout_ns / std.time.ns_per_s),
                 .nsec = @intCast(options.timeout_ns % std.time.ns_per_s),
@@ -189,122 +355,176 @@ const Handshake = struct {
             .recv_len = 0,
             .version_received = false,
             .verack_received = false,
-            .phase = .connecting,
         };
+
+        slot.arm(.timeout);
+        slot.arm(.connect);
+        log.info("connecting to {f}", .{address});
     }
 
-    fn run(handshake: *Handshake) !void {
-        try handshake.io.prep_timeout(user_data_timeout, &handshake.deadline);
-        try handshake.io.prep_connect(user_data_io, handshake.fd, &handshake.sockaddr);
-        log.info("connecting to {f}", .{handshake.address});
+    /// Queue one SQE and count it against `in_flight`. The shared ring is sized
+    /// (`min_ring_entries`) so the SQ can never be full here.
+    fn arm(slot: *Handshake, comptime op: ArmOp) void {
+        switch (op) {
+            .timeout => slot.io.prep_timeout(slot.tag(completion_timeout), &slot.deadline) catch unreachable,
+            .connect => slot.io.prep_connect(slot.tag(completion_io), slot.fd, &slot.sockaddr) catch unreachable,
+            .send => slot.io.prep_send(slot.tag(completion_io), slot.fd, slot.send_frame) catch unreachable,
+            .recv => slot.io.prep_recv(
+                slot.tag(completion_io),
+                slot.fd,
+                slot.recv_buffer[slot.recv_len..],
+            ) catch unreachable,
+        }
+        slot.in_flight += 1;
+    }
 
-        var completions: u32 = 0;
-        while (handshake.phase != .complete) : (completions += 1) {
-            if (completions >= completions_max) return error.TooManyCompletions;
+    fn tag(slot: *Handshake, comptime index: usize) u64 {
+        comptime assert(index < completion_count);
+        return @intCast(@intFromPtr(&slot.completions[index]));
+    }
 
-            const cqe = try handshake.io.next_completion();
-            if (cqe.user_data == user_data_timeout) return error.Timeout;
-            assert(cqe.user_data == user_data_io);
+    fn on_completion(slot: *Handshake, kind: Completion.Kind, cqe: linux.io_uring_cqe) void {
+        assert(slot.in_flight > 0);
+        slot.in_flight -= 1;
+        slot.seen += 1;
 
-            try handshake.on_completion(cqe);
+        switch (slot.status) {
+            .idle, .settled => unreachable,
+            .winding => {
+                // Outcome already decided; just drain the cancelled SQE(s).
+                if (slot.in_flight == 0) slot.status = .settled;
+            },
+            .dialing => slot.step(kind, cqe),
+        }
+    }
+
+    /// Advance a running handshake by one completion.
+    fn step(slot: *Handshake, kind: Completion.Kind, cqe: linux.io_uring_cqe) void {
+        assert(slot.status == .dialing);
+
+        if (slot.seen > completions_max) return slot.finish(error.TooManyCompletions, kind);
+        switch (kind) {
+            .cancel => unreachable, // only issued once status is .winding
+            .timeout => return slot.finish(error.Timeout, kind),
+            .io => {},
         }
 
-        assert(handshake.version_received);
-        assert(handshake.verack_received);
-        log.info("handshake complete with {f}", .{handshake.address});
+        slot.on_io(cqe) catch |err| return slot.finish(err, kind);
+        if (slot.phase == .complete) {
+            assert(slot.version_received and slot.verack_received);
+            slot.finish({}, kind);
+        }
     }
 
-    fn on_completion(handshake: *Handshake, cqe: linux.io_uring_cqe) !void {
-        switch (handshake.phase) {
+    /// Record the outcome, cancel whichever SQE this handshake still has armed
+    /// (the timer, unless we are finishing *because* the timer fired), and move
+    /// to `.winding` until that cancellation's CQEs drain. No synchronous reap:
+    /// the event loop picks those CQEs up while other handshakes run.
+    fn finish(slot: *Handshake, outcome: DialError!void, trigger: Completion.Kind) void {
+        assert(slot.status == .dialing);
+        slot.outcome = outcome;
+        if (outcome) |_| {
+            log.info("handshake complete with {f}", .{slot.address});
+        } else |err| {
+            log.warn("handshake with {f} failed: {t}", .{ slot.address, err });
+        }
+
+        // Whichever SQE we did not just reap is still armed.
+        if (trigger == .timeout) {
+            slot.io.prep_cancel(slot.tag(completion_cancel), slot.tag(completion_io)) catch unreachable;
+        } else {
+            slot.io.prep_timeout_remove(slot.tag(completion_cancel), slot.tag(completion_timeout)) catch unreachable;
+        }
+        slot.in_flight += 1; // the cancel / remove op's own CQE
+        slot.status = .winding;
+        assert(slot.in_flight >= 2); // that CQE, plus the still-armed target's
+    }
+
+    fn on_io(slot: *Handshake, cqe: linux.io_uring_cqe) DialError!void {
+        switch (slot.phase) {
             .connecting => {
                 try check_completion(cqe);
                 assert(cqe.res == 0);
                 log.info("tcp connected", .{});
-                try handshake.send_version();
+                try slot.send_version();
             },
             .sending => {
                 try check_completion(cqe);
                 const sent: u32 = @intCast(cqe.res);
-                assert(sent <= handshake.send_frame.len);
-                handshake.send_frame = handshake.send_frame[sent..];
-                if (handshake.send_frame.len > 0) {
-                    // Rare short send: push the remainder before advancing.
-                    try handshake.io.prep_send(user_data_io, handshake.fd, handshake.send_frame);
+                assert(sent <= slot.send_frame.len);
+                slot.send_frame = slot.send_frame[sent..];
+                if (slot.send_frame.len > 0) {
+                    slot.arm(.send); // rare short send: push the remainder
                     return;
                 }
-                try handshake.advance();
+                try slot.advance();
             },
             .receiving => {
                 try check_completion(cqe);
                 const received: u32 = @intCast(cqe.res);
                 if (received == 0) return error.EndOfStream;
-                handshake.recv_len += received;
-                assert(handshake.recv_len <= recv_buffer_len);
-                try handshake.advance();
+                slot.recv_len += received;
+                assert(slot.recv_len <= recv_buffer_len);
+                try slot.advance();
             },
             .complete => unreachable,
         }
     }
 
-    /// Drain whatever full messages are buffered, then arm the next SQE.
-    fn advance(handshake: *Handshake) !void {
-        switch (try handshake.pump()) {
-            .complete => handshake.phase = .complete,
+    /// Process whatever whole messages are buffered, then arm the next SQE.
+    fn advance(slot: *Handshake) DialError!void {
+        switch (try slot.pump()) {
+            .complete => slot.phase = .complete,
             .awaiting_more => {
-                assert(handshake.recv_len < recv_buffer_len);
-                try handshake.io.prep_recv(
-                    user_data_io,
-                    handshake.fd,
-                    handshake.recv_buffer[handshake.recv_len..],
-                );
-                handshake.phase = .receiving;
+                assert(slot.recv_len < recv_buffer_len);
+                slot.arm(.recv);
+                slot.phase = .receiving;
             },
             .send_verack => {
-                const frame = frame_in_place(&handshake.send_buffer, handshake.options.magic, "verack", 0);
-                try handshake.arm_send(frame);
+                const frame = frame_in_place(&slot.send_buffer, slot.options.magic, "verack", 0);
+                assert(frame.len >= header_len);
+                slot.send_frame = frame;
+                slot.arm(.send);
+                slot.phase = .sending;
                 log.info("-> verack", .{});
             },
         }
     }
 
-    fn send_version(handshake: *Handshake) !void {
+    fn send_version(slot: *Handshake) DialError!void {
         const payload = build_version(
-            handshake.send_buffer[header_len..],
-            handshake.address,
-            handshake.options,
+            slot.send_buffer[header_len..],
+            slot.address,
+            slot.options,
         );
         const frame = frame_in_place(
-            &handshake.send_buffer,
-            handshake.options.magic,
+            &slot.send_buffer,
+            slot.options.magic,
             "version",
             @intCast(payload.len),
         );
-        try handshake.arm_send(frame);
+        assert(frame.len >= header_len);
+        slot.send_frame = frame;
+        slot.arm(.send);
+        slot.phase = .sending;
         log.info("-> version (protocol={d}, user_agent={s})", .{
-            handshake.options.protocol_version, handshake.options.user_agent,
+            slot.options.protocol_version, slot.options.user_agent,
         });
     }
 
-    fn arm_send(handshake: *Handshake, frame: []const u8) !void {
-        assert(frame.len >= header_len);
-        handshake.send_frame = frame;
-        try handshake.io.prep_send(user_data_io, handshake.fd, frame);
-        handshake.phase = .sending;
-    }
-
-    fn pump(handshake: *Handshake) !PumpResult {
+    fn pump(slot: *Handshake) !PumpResult {
         while (true) {
-            if (handshake.recv_len < header_len) return .awaiting_more;
+            if (slot.recv_len < header_len) return .awaiting_more;
 
             const header = try parse_header(
-                handshake.recv_buffer[0..header_len],
-                handshake.options.magic,
+                slot.recv_buffer[0..header_len],
+                slot.options.magic,
             );
             const total = header_len + header.payload_len;
             if (total > recv_buffer_len) return error.MessageTooLarge;
-            if (handshake.recv_len < total) return .awaiting_more;
+            if (slot.recv_len < total) return .awaiting_more;
 
-            const payload = handshake.recv_buffer[header_len..total];
+            const payload = slot.recv_buffer[header_len..total];
             var reply_with_verack = false;
 
             if (command_eql(&header.command, "version")) {
@@ -312,16 +532,16 @@ const Handshake = struct {
                 if (!std.mem.eql(u8, &double_sha256_prefix(payload), &header.checksum)) {
                     return error.ChecksumMismatch;
                 }
-                try parse_version(handshake.peer, payload);
-                handshake.version_received = true;
+                try parse_version(&slot.peer, payload);
+                slot.version_received = true;
                 reply_with_verack = true;
                 log.info("<- version (protocol={d}, services=0x{x}, user_agent={s})", .{
-                    handshake.peer.protocol_version,
-                    handshake.peer.services,
-                    handshake.peer.user_agent(),
+                    slot.peer.protocol_version,
+                    slot.peer.services,
+                    slot.peer.user_agent(),
                 });
             } else if (command_eql(&header.command, "verack")) {
-                handshake.verack_received = true;
+                slot.verack_received = true;
                 log.info("<- verack", .{});
             } else {
                 log.debug("<- {s} ({d} bytes, ignored)", .{
@@ -330,16 +550,16 @@ const Handshake = struct {
             }
 
             // Drop the consumed message from the front of the buffer.
-            const rest = handshake.recv_len - total;
+            const rest = slot.recv_len - total;
             std.mem.copyForwards(
                 u8,
-                handshake.recv_buffer[0..rest],
-                handshake.recv_buffer[total..handshake.recv_len],
+                slot.recv_buffer[0..rest],
+                slot.recv_buffer[total..slot.recv_len],
             );
-            handshake.recv_len = rest;
+            slot.recv_len = rest;
 
             if (reply_with_verack) return .send_verack;
-            if (handshake.version_received and handshake.verack_received) return .complete;
+            if (slot.version_received and slot.verack_received) return .complete;
         }
     }
 };
@@ -554,7 +774,7 @@ fn fill_nonce(nonce: *[8]u8) void {
 }
 
 /// Map a failed CQE (`res` < 0) to an error.
-fn check_completion(cqe: linux.io_uring_cqe) !void {
+fn check_completion(cqe: linux.io_uring_cqe) DialError!void {
     if (cqe.res >= 0) return;
     switch (cqe.err()) {
         .CONNREFUSED => return error.ConnectionRefused,
