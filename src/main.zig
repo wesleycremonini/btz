@@ -4,8 +4,10 @@ const Io = std.Io;
 const net = std.Io.net;
 
 const handshake = @import("handshake.zig");
+const crawl = @import("crawl.zig");
 const io_uring = @import("io.zig");
 const seeds = @import("seeds.zig");
+const PeerLog = crawl.PeerLog;
 const log = std.log.scoped(.main);
 
 /// One line per dialed peer is written here; truncated at the start of each run.
@@ -32,7 +34,7 @@ const ring_entries = 256;
 
 comptime {
     assert(std.math.isPowerOfTwo(ring_entries));
-    assert(ring_entries >= handshake.min_ring_entries(concurrency, seed_addresses_max));
+    assert(ring_entries >= crawl.min_ring_entries(concurrency, seed_addresses_max));
     assert(concurrency >= 1);
     assert(handshake_target >= 1);
     assert(handshake_target <= seed_addresses_max);
@@ -68,14 +70,14 @@ pub fn main(init: std.process.Init) !void {
 
     // One record line per dialed address, written onto `io` as `IORING_OP_WRITE`s
     // so the crawl loop never blocks on the log file.
-    var log_lines: [seed_addresses_max]handshake.PeerLog.Line = undefined;
-    var peer_log = handshake.PeerLog.init(&io, log_file.handle, log_lines[0..addresses.len]);
+    var log_lines: [seed_addresses_max]PeerLog.Line = undefined;
+    var peer_log = PeerLog.init(&io, log_file.handle, log_lines[0..addresses.len]);
 
     // Every handshake runs on this one ring, identified by a pointer stored in
     // its SQE `user_data`; `connect_all` returns with the ring drained, having
     // written one `btz.log` line per dialed peer as each settled.
     var slots: [concurrency]handshake.Handshake = undefined;
-    const summary = handshake.connect_all(
+    const summary = crawl.connect_all(
         &io,
         &peer_log,
         addresses,
@@ -142,7 +144,11 @@ fn collect_seed_addresses(
 }
 
 test {
+    _ = @import("message.zig");
+    _ = @import("version.zig");
     _ = @import("handshake.zig");
+    _ = @import("peer_log.zig");
+    _ = @import("crawl.zig");
     _ = @import("io.zig");
     _ = @import("seeds.zig");
 }

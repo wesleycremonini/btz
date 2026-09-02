@@ -31,9 +31,9 @@ pub const mainnet_dns_seeds = [_]Seed{
 };
 
 test "seed list is non-empty and every host is a bare hostname" {
-    // `handshake.dial` passes each `host` straight to the resolver, so a stray
-    // scheme ("tcp://") or ":port" suffix would silently fail to resolve.
-    // Guard against that at compile-test time rather than at runtime.
+    // `main.collect_seed_addresses` passes each `host` straight to the resolver,
+    // so a stray scheme ("tcp://") or ":port" suffix would silently fail to
+    // resolve. Guard against that at compile-test time rather than at runtime.
     try std.testing.expect(mainnet_dns_seeds.len > 0);
     for (mainnet_dns_seeds) |seed| {
         try std.testing.expect(seed.host.len > 0);
