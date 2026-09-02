@@ -8,6 +8,17 @@ const io_uring = @import("io.zig");
 const seeds = @import("seeds.zig");
 const log = std.log.scoped(.main);
 
+/// One line per dialed peer is written here; truncated at the start of each run.
+const log_path = "btz.log";
+
+/// The handshake narrates each step on the `.p2p` scope at `debug`; the peer
+/// record now lives in `log_path`, so keep that scope quiet by default.
+pub const std_options: std.Options = .{
+    .log_scope_levels = &.{
+        .{ .scope = .p2p, .level = .warn },
+    },
+};
+
 /// Handshakes kept in flight on the ring at once.
 const concurrency = 8;
 /// Successful handshakes to reach before we stop dialing new addresses.
@@ -49,35 +60,31 @@ pub fn main(init: std.process.Init) !void {
     var io: io_uring.IO = try .init(ring_entries);
     defer io.deinit();
 
+    var file = Io.Dir.cwd().createFile(init.io, log_path, .{}) catch |err| {
+        log.err("create {s}: {t}", .{ log_path, err });
+        return err;
+    };
+    defer file.close(init.io);
+    var file_buffer: [512]u8 = undefined;
+    var file_writer = file.writer(init.io, &file_buffer);
+
     // Every handshake runs on this one ring, identified by a pointer stored in
-    // its SQE `user_data`; `connect_all` returns with the ring drained.
+    // its SQE `user_data`; `connect_all` returns with the ring drained, having
+    // written one `btz.log` line per dialed peer as each settled.
     var slots: [concurrency]handshake.Handshake = undefined;
-    var results: [seed_addresses_max]handshake.Result = undefined;
-    handshake.connect_all(&io, addresses, slots[0..], results[0..addresses.len], handshake_target, .{});
+    const summary = handshake.connect_all(
+        &io,
+        &file_writer.interface,
+        addresses,
+        slots[0..],
+        handshake_target,
+        .{},
+    );
 
-    var stdout_buffer: [512]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
-    const stdout = &stdout_writer.interface;
-
-    var succeeded: u32 = 0;
-    for (addresses, results[0..addresses.len]) |address, result| {
-        if (result.outcome) |_| {
-            succeeded += 1;
-            try stdout.print("[ok]   {f}  protocol {d}  services 0x{x}  {s}\n", .{
-                address,              result.peer.protocol_version,
-                result.peer.services, result.peer.user_agent(),
-            });
-        } else |err| switch (err) {
-            error.Skipped => {},
-            else => log.warn("[fail] {f}: {t}", .{ address, err }),
-        }
-    }
-    try stdout.flush();
-
-    log.info("handshakes: {d} ok", .{succeeded});
-    if (succeeded == 0) return error.AllHandshakesFailed;
-    if (succeeded < handshake_target) {
-        log.warn("only {d} of {d} target handshakes succeeded", .{ succeeded, handshake_target });
+    log.info("wrote {s}: {d} ok / {d} dialed", .{ log_path, summary.succeeded, summary.dialed });
+    if (summary.succeeded == 0) return error.AllHandshakesFailed;
+    if (summary.succeeded < handshake_target) {
+        log.warn("only {d} of {d} target handshakes succeeded", .{ summary.succeeded, handshake_target });
     }
 }
 

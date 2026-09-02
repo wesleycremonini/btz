@@ -3,3 +3,5 @@ zig-out/
 
 # Local agent-instruction symlinks -> AGENTS.md
 CLAUDE.md
+
+*.log

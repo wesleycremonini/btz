@@ -7,7 +7,8 @@
 //! `Completion`s as its `user_data`, so a CQE names both the handshake and which
 //! op finished; a slot stays alive until its outstanding completions drain, so
 //! nothing needs a synchronous ring scrub between handshakes. Nothing is
-//! allocated: the pool, the per-slot buffers, and the results are caller-owned.
+//! allocated: the caller owns the slot pool. As each handshake settles,
+//! `connect_all` writes one line to a caller-supplied sink describing that peer.
 //!
 //! The wire format is a 24-byte header (magic, 12-byte command, payload length,
 //! truncated double-SHA256 checksum) followed by the payload.
@@ -141,12 +142,47 @@ pub const DialError = error{
     Unexpected,
 };
 
-/// Outcome of dialing one address. `peer` is meaningful only when `outcome` is
-/// not an error.
-pub const Result = struct {
-    outcome: DialError!void,
-    peer: PeerInfo,
+/// Tally returned by `connect_all`. The per-peer detail is in the log sink.
+pub const Summary = struct {
+    /// Addresses actually dialed (a handshake started, or the socket failed).
+    dialed: u32,
+    /// Of those, how many completed the version/verack exchange.
+    succeeded: u32,
 };
+
+/// Mutable dialing progress shared between `connect_all` and `fill_slot`.
+const Progress = struct {
+    /// Index of the next address to dial.
+    next: u32,
+    dialed: u32,
+    succeeded: u32,
+};
+
+/// Write one line for one peer to `sink` and flush it, so the log is complete
+/// and current the moment a handshake settles. A write failure is logged, not
+/// propagated: it must not abort the run.
+fn write_peer_line(
+    sink: *std.Io.Writer,
+    address: net.IpAddress,
+    outcome: DialError!void,
+    peer: ?*const PeerInfo,
+) void {
+    const printed = if (outcome) |_| blk: {
+        assert(peer != null);
+        break :blk sink.print("{f}\tok\t{d}\t0x{x}\t{s}\n", .{
+            address,
+            peer.?.protocol_version,
+            peer.?.services,
+            peer.?.user_agent(),
+        });
+    } else |err| sink.print("{f}\tfail\t{s}\n", .{ address, @errorName(err) });
+
+    printed catch |err| {
+        log.err("write peer line for {f}: {t}", .{ address, err });
+        return;
+    };
+    sink.flush() catch |err| log.err("flush peer log: {t}", .{err});
+}
 
 /// CQEs `connect_all` copies out of the ring per loop iteration.
 const reap_batch = 32;
@@ -160,18 +196,17 @@ pub fn min_ring_entries(pool_slots: usize) usize {
 
 /// Handshake every address in `addresses`, keeping up to `slots.len` in flight
 /// at once on the shared `io` ring, and stop starting new ones once `target`
-/// have succeeded. `results` is filled one-to-one with `addresses`; an address
-/// never dialed keeps its `error.Skipped` outcome. `slots` and `results` are
-/// caller-owned; nothing is allocated.
+/// have succeeded. Writes exactly one line to `sink` per dialed peer, at the
+/// moment that peer's handshake settles. `slots` is caller-owned; nothing is
+/// allocated.
 pub fn connect_all(
     io: *io_uring.IO,
+    sink: *std.Io.Writer,
     addresses: []const net.IpAddress,
     slots: []Handshake,
-    results: []Result,
     target: u32,
     options: Options,
-) void {
-    assert(addresses.len == results.len);
+) Summary {
     assert(slots.len >= 1);
     assert(target >= 1);
     assert(options.magic != 0);
@@ -179,18 +214,16 @@ pub fn connect_all(
     assert(options.user_agent.len <= max_user_agent_len);
     assert(options.timeout_ns > 0);
 
-    for (results) |*result| result.* = .{ .outcome = error.Skipped, .peer = undefined };
     for (slots) |*slot| slot.status = .idle;
 
-    var next: u32 = 0; // index of the next address to dial
-    var succeeded: u32 = 0; // handshakes completed OK so far
-    for (slots) |*slot| fill_slot(io, slot, addresses, results, &next, succeeded, target, options);
+    var progress: Progress = .{ .next = 0, .dialed = 0, .succeeded = 0 };
+    for (slots) |*slot| fill_slot(io, sink, slot, addresses, &progress, target, options);
 
     var cqes: [reap_batch]linux.io_uring_cqe = undefined;
     while (any_busy(slots)) {
         const count = io.submit_and_reap(&cqes) catch |err| {
             log.err("io_uring reap failed: {t}; {d} handshake(s) abandoned", .{ err, busy_count(slots) });
-            return;
+            break;
         };
         for (cqes[0..count]) |cqe| {
             const completion: *Completion = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
@@ -199,14 +232,17 @@ pub fn connect_all(
             if (slot.status != .settled) continue;
 
             io_uring.close_socket(slot.fd);
-            results[slot.result_index] = .{ .outcome = slot.outcome, .peer = slot.peer };
+            write_peer_line(sink, slot.address, slot.outcome, &slot.peer);
+            progress.dialed += 1;
             if (slot.outcome) |_| {
-                succeeded += 1;
+                progress.succeeded += 1;
             } else |_| {}
             slot.status = .idle;
-            fill_slot(io, slot, addresses, results, &next, succeeded, target, options);
+            fill_slot(io, sink, slot, addresses, &progress, target, options);
         }
     }
+
+    return .{ .dialed = progress.dialed, .succeeded = progress.succeeded };
 }
 
 fn any_busy(slots: []const Handshake) bool {
@@ -226,33 +262,33 @@ fn busy_count(slots: []const Handshake) u32 {
 
 /// Take addresses off the front of the queue until one handshake starts on
 /// `slot`, or there is nothing left to dial (`target` reached or list
-/// exhausted), leaving the slot `.idle`. A socket that will not open or start is
-/// recorded straight into `results` and the next address tried.
+/// exhausted), leaving the slot `.idle`. A socket that will not open or start
+/// gets its one `sink` line here and counts as dialed.
 fn fill_slot(
     io: *io_uring.IO,
+    sink: *std.Io.Writer,
     slot: *Handshake,
     addresses: []const net.IpAddress,
-    results: []Result,
-    next: *u32,
-    succeeded: u32,
+    progress: *Progress,
     target: u32,
     options: Options,
 ) void {
     assert(slot.status == .idle);
-    while (succeeded < target and next.* < addresses.len) {
-        const index = next.*;
-        next.* += 1;
-        const address = addresses[index];
+    while (progress.succeeded < target and progress.next < addresses.len) {
+        const address = addresses[progress.next];
+        progress.next += 1;
 
         const fd = io_uring.open_socket(address) catch |err| {
-            log.warn("open socket for {f}: {t}", .{ address, err });
-            results[index] = .{ .outcome = error.SocketUnavailable, .peer = undefined };
+            log.debug("open socket for {f}: {t}", .{ address, err });
+            write_peer_line(sink, address, error.SocketUnavailable, null);
+            progress.dialed += 1;
             continue;
         };
-        slot.start(io, fd, address, index, options) catch |err| {
-            log.warn("start handshake with {f}: {t}", .{ address, err });
+        slot.start(io, fd, address, options) catch |err| {
+            log.debug("start handshake with {f}: {t}", .{ address, err });
             io_uring.close_socket(fd);
-            results[index] = .{ .outcome = error.SocketUnavailable, .peer = undefined };
+            write_peer_line(sink, address, error.SocketUnavailable, null);
+            progress.dialed += 1;
             continue;
         };
         return;
@@ -272,8 +308,6 @@ pub const Handshake = struct {
     options: Options,
     address: net.IpAddress,
 
-    /// Which `results` entry this slot fills once it settles.
-    result_index: u32,
     outcome: DialError!void,
     peer: PeerInfo,
 
@@ -320,7 +354,6 @@ pub const Handshake = struct {
         io: *io_uring.IO,
         fd: linux.fd_t,
         address: net.IpAddress,
-        result_index: u32,
         options: Options,
     ) io_uring.SockAddr.FromError!void {
         assert(slot.status == .idle);
@@ -332,7 +365,6 @@ pub const Handshake = struct {
             .fd = fd,
             .options = options,
             .address = address,
-            .result_index = result_index,
             .outcome = {},
             .peer = undefined,
             .completions = .{
@@ -359,7 +391,7 @@ pub const Handshake = struct {
 
         slot.arm(.timeout);
         slot.arm(.connect);
-        log.info("connecting to {f}", .{address});
+        log.debug("connecting to {f}", .{address});
     }
 
     /// Queue one SQE and count it against `in_flight`. The shared ring is sized
@@ -423,11 +455,6 @@ pub const Handshake = struct {
     fn finish(slot: *Handshake, outcome: DialError!void, trigger: Completion.Kind) void {
         assert(slot.status == .dialing);
         slot.outcome = outcome;
-        if (outcome) |_| {
-            log.info("handshake complete with {f}", .{slot.address});
-        } else |err| {
-            log.warn("handshake with {f} failed: {t}", .{ slot.address, err });
-        }
 
         // Whichever SQE we did not just reap is still armed.
         if (trigger == .timeout) {
@@ -445,7 +472,7 @@ pub const Handshake = struct {
             .connecting => {
                 try check_completion(cqe);
                 assert(cqe.res == 0);
-                log.info("tcp connected", .{});
+                log.debug("tcp connected", .{});
                 try slot.send_version();
             },
             .sending => {
@@ -486,7 +513,7 @@ pub const Handshake = struct {
                 slot.send_frame = frame;
                 slot.arm(.send);
                 slot.phase = .sending;
-                log.info("-> verack", .{});
+                log.debug("-> verack", .{});
             },
         }
     }
@@ -507,7 +534,7 @@ pub const Handshake = struct {
         slot.send_frame = frame;
         slot.arm(.send);
         slot.phase = .sending;
-        log.info("-> version (protocol={d}, user_agent={s})", .{
+        log.debug("-> version (protocol={d}, user_agent={s})", .{
             slot.options.protocol_version, slot.options.user_agent,
         });
     }
@@ -535,14 +562,14 @@ pub const Handshake = struct {
                 try parse_version(&slot.peer, payload);
                 slot.version_received = true;
                 reply_with_verack = true;
-                log.info("<- version (protocol={d}, services=0x{x}, user_agent={s})", .{
+                log.debug("<- version (protocol={d}, services=0x{x}, user_agent={s})", .{
                     slot.peer.protocol_version,
                     slot.peer.services,
                     slot.peer.user_agent(),
                 });
             } else if (command_eql(&header.command, "verack")) {
                 slot.verack_received = true;
-                log.info("<- verack", .{});
+                log.debug("<- verack", .{});
             } else {
                 log.debug("<- {s} ({d} bytes, ignored)", .{
                     command_name(&header.command), header.payload_len,
