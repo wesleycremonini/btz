@@ -30,13 +30,15 @@ pub const mainnet_dns_seeds = [_]Seed{
     .{ .host = "seed.bitcoin.wiz.biz", .operator = "Jason Maurice" },
 };
 
-test "seed list is non-empty and well-formed" {
+test "seed list is non-empty and every host is a bare hostname" {
+    // `handshake.dial` passes each `host` straight to the resolver, so a stray
+    // scheme ("tcp://") or ":port" suffix would silently fail to resolve.
+    // Guard against that at compile-test time rather than at runtime.
     try std.testing.expect(mainnet_dns_seeds.len > 0);
-    for (mainnet_dns_seeds) |s| {
-        try std.testing.expect(s.host.len > 0);
-        try std.testing.expect(s.operator.len > 0);
-        // hostnames only, no scheme or port suffix
-        try std.testing.expect(std.mem.indexOfScalar(u8, s.host, '/') == null);
-        try std.testing.expect(std.mem.indexOfScalar(u8, s.host, ':') == null);
+    for (mainnet_dns_seeds) |seed| {
+        try std.testing.expect(seed.host.len > 0);
+        try std.testing.expect(seed.operator.len > 0);
+        try std.testing.expect(std.mem.indexOfScalar(u8, seed.host, '/') == null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, seed.host, ':') == null);
     }
 }
