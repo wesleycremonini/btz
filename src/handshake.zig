@@ -1,18 +1,20 @@
-//! Bitcoin P2P version/verack handshake over TCP.
+//! Bitcoin P2P version/verack handshake, driven by the io_uring event loop.
 //!
-//! `connect` opens a stream to a peer, sends a `version` message, exchanges
-//! `verack`, and logs each step, writing what the peer advertised into a
-//! caller-owned `PeerInfo`. The wire format is a 24-byte header (magic,
-//! 12-byte command, payload length, truncated double-SHA256 checksum) followed
-//! by the payload.
+//! `connect` opens a socket, then runs a small state machine off `IO`
+//! completions: connect -> send our `version` -> receive the peer's `version`
+//! (reply `verack`) and `verack` -> done. It writes what the peer advertised
+//! into a caller-owned `PeerInfo`. Nothing is allocated: the send frame and the
+//! receive buffer live in the `Handshake` state struct.
 //!
-//! No memory is allocated: the peer's `version` is read into a stack buffer and
-//! every other message is skipped in place.
+//! The wire format is a 24-byte header (magic, 12-byte command, payload length,
+//! truncated double-SHA256 checksum) followed by the payload.
 
 const std = @import("std");
 const assert = std.debug.assert;
 
+const linux = std.os.linux;
 const net = std.Io.net;
+const io_uring = @import("io.zig");
 const log = std.log.scoped(.p2p);
 
 /// Network magic prefixing every message on each network.
@@ -32,8 +34,7 @@ const length_offset = command_offset + command_len;
 const checksum_offset = length_offset + length_len;
 
 /// Sanity bound on a message's length field. The protocol maximum is 32 MiB; a
-/// handshake never approaches it, and non-`version` messages are skipped
-/// without buffering, so this only guards the length field itself.
+/// handshake never approaches it.
 const message_payload_max = 4 * 1024 * 1024;
 
 /// `MAX_SUBVERSION_LENGTH` in Bitcoin Core.
@@ -43,22 +44,25 @@ const max_user_agent_len = 256;
 /// version(4) + services(8) + timestamp(8) + addr_recv(26) + addr_from(26) + nonce(8).
 const version_prefix_len = 4 + 8 + 8 + 26 + 26 + 8;
 
-/// Smallest and largest `version` payload we produce or accept: the fixed
-/// prefix, the user-agent var_str (length prefix up to 3 bytes, string up to
-/// `max_user_agent_len`), then start_height(4) + relay(1).
+/// Smallest and largest `version` payload we produce or accept.
 const version_payload_min = version_prefix_len + 1 + 0 + 4 + 1;
 const version_payload_max = version_prefix_len + 3 + max_user_agent_len + 4 + 1;
 
-/// Upper bound on messages read during a handshake. version + verack is the
-/// core exchange; BIP-155 lets a few zero-payload messages (wtxidrelay,
-/// sendaddrv2, sendcmpct, feefilter, an early ping) arrive in between.
-const messages_max = 32;
+/// Receive buffer. Must hold the largest single message we parse (a `version`)
+/// plus its header; other messages are consumed and dropped from the front.
+const recv_buffer_len = 4 * 1024;
 
-/// Addresses a single DNS-seed lookup may yield before we stop dialing.
-const dial_addresses_max = 32;
+/// Send buffer: one framed message at a time (our `version` is the largest).
+const frame_buffer_len = header_len + version_payload_max;
 
-const read_buffer_len = 8 * 1024;
-const write_buffer_len = 4 * 1024;
+/// Upper bound on completions processed during one handshake. connect + our
+/// version send + a handful of recvs + our verack send + the peer's trailing
+/// messages fit comfortably; this only bounds a pathological peer.
+const completions_max = 64;
+
+// `user_data` tags distinguishing the two SQEs a handshake keeps in flight.
+const user_data_io: u64 = 1;
+const user_data_timeout: u64 = 2;
 
 comptime {
     assert(header_len == 24);
@@ -67,8 +71,11 @@ comptime {
     assert(checksum_offset == magic_len + command_len + length_len);
     assert(version_payload_min <= version_payload_max);
     assert(version_payload_max <= message_payload_max);
-    assert(max_user_agent_len < version_payload_max);
-    assert(version_payload_max <= read_buffer_len);
+    assert(recv_buffer_len >= header_len + version_payload_max);
+    assert(frame_buffer_len >= header_len + version_payload_max);
+    assert(user_data_io != 0);
+    assert(user_data_timeout != 0);
+    assert(user_data_io != user_data_timeout);
 }
 
 pub const Options = struct {
@@ -80,11 +87,8 @@ pub const Options = struct {
     user_agent: []const u8 = "/btc-crawler:0.1.0/",
     /// Network magic.
     magic: u32 = mainnet_magic,
-    /// Restrict a DNS name's resolved addresses to one family before dialing.
-    /// Defaults to IPv4: `std.Io.Threaded` (0.16.0) has no connect timeout, so a
-    /// black-holed IPv6 address would hang forever on a host without IPv6.
-    /// `null` tries both, `.ip6` forces IPv6.
-    address_family: ?net.IpAddress.Family = .ip4,
+    /// Whole-handshake deadline in nanoseconds.
+    timeout_ns: u63 = 10 * std.time.ns_per_s,
 };
 
 /// What the peer advertised in its own `version`. Filled in place by `connect`.
@@ -106,133 +110,239 @@ pub const HandshakeError = error{
     MagicMismatch,
     /// The peer's `version` checksum did not match its payload.
     ChecksumMismatch,
-    /// A length field exceeded `message_payload_max`, or a `version` exceeded
-    /// `version_payload_max`.
+    /// A length field, or a `version`, exceeded what we will buffer.
     MessageTooLarge,
     /// The peer's `version` payload was too short or internally inconsistent.
     MalformedVersion,
-    /// `messages_max` messages passed without both `version` and `verack`.
-    HandshakeIncomplete,
+    /// The peer closed the connection mid-handshake.
+    EndOfStream,
+    /// The handshake did not finish within `Options.timeout_ns`.
+    Timeout,
+    /// `completions_max` completions passed without finishing (hostile peer).
+    TooManyCompletions,
 };
 
-/// Connect to `host:port`, complete the version/verack handshake, and write the
-/// peer's advertised details into `peer`.
-///
-/// `host` may be a literal IPv4/IPv6 address or a DNS name; a name is resolved
-/// via `io` and its addresses are dialed in order until one connects.
-pub fn connect(peer: *PeerInfo, io: std.Io, host: []const u8, port: u16, options: Options) !void {
-    assert(host.len > 0);
-    assert(port != 0);
+/// Open a socket to `address`, run the handshake on `io`, and write the peer's
+/// advertised details into `peer`. `address` must already be resolved.
+pub fn connect(peer: *PeerInfo, io: *io_uring.IO, address: net.IpAddress, options: Options) !void {
     assert(options.magic != 0);
     assert(options.user_agent.len > 0);
     assert(options.user_agent.len <= max_user_agent_len);
+    assert(options.timeout_ns > 0);
 
-    log.info("connecting to {s}:{d}", .{ host, port });
-    const stream = try dial(io, host, port, options.address_family);
-    defer stream.close(io);
-    log.info("tcp connected", .{});
+    const fd = try io_uring.open_socket(address);
+    defer io_uring.close_socket(fd);
 
-    var read_buffer: [read_buffer_len]u8 = undefined;
-    var write_buffer: [write_buffer_len]u8 = undefined;
-    var stream_reader = stream.reader(io, &read_buffer);
-    var stream_writer = stream.writer(io, &write_buffer);
+    var handshake: Handshake = undefined;
+    try handshake.init(peer, io, fd, address, options);
+    try handshake.run();
+}
 
-    var version_buffer: [version_payload_max]u8 = undefined;
-    const version_payload = build_version(io, &version_buffer, port, options);
-    try write_message(&stream_writer, options.magic, "version", version_payload);
-    log.info("-> version (protocol={d}, user_agent={s})", .{
-        options.protocol_version, options.user_agent,
-    });
+const Handshake = struct {
+    io: *io_uring.IO,
+    fd: linux.fd_t,
+    options: Options,
+    address: net.IpAddress,
+    peer: *PeerInfo,
 
-    var version_received = false;
-    var verack_received = false;
-    var scratch: [version_payload_max]u8 = undefined;
+    /// Stable storage the connect SQE points at.
+    sockaddr: io_uring.SockAddr,
+    /// Stable storage the timeout SQE points at.
+    deadline: linux.kernel_timespec,
 
-    var messages_seen: u32 = 0;
-    while (messages_seen < messages_max) : (messages_seen += 1) {
-        const header = try read_header(&stream_reader, options.magic);
+    send_buffer: [frame_buffer_len]u8,
+    /// The not-yet-sent tail of the current frame (a slice into `send_buffer`).
+    send_frame: []const u8,
 
-        if (command_eql(&header.command, "version")) {
-            try receive_version(peer, &stream_reader, &header, &scratch);
-            version_received = true;
-            log.info("<- version (protocol={d}, services=0x{x}, user_agent={s})", .{
-                peer.protocol_version, peer.services, peer.user_agent(),
-            });
-            try write_message(&stream_writer, options.magic, "verack", &.{});
-            log.info("-> verack", .{});
-        } else {
-            // verack and anything else carry no payload we need; skip in place.
-            stream_reader.interface.discardAll(header.payload_len) catch |err|
-                return read_err(&stream_reader, err);
-            if (command_eql(&header.command, "verack")) {
-                verack_received = true;
+    recv_buffer: [recv_buffer_len]u8,
+    recv_len: u32,
+
+    version_received: bool,
+    verack_received: bool,
+    phase: Phase,
+
+    const Phase = enum { connecting, sending, receiving, complete };
+    const PumpResult = enum { awaiting_more, send_verack, complete };
+
+    fn init(
+        handshake: *Handshake,
+        peer: *PeerInfo,
+        io: *io_uring.IO,
+        fd: linux.fd_t,
+        address: net.IpAddress,
+        options: Options,
+    ) !void {
+        handshake.* = .{
+            .io = io,
+            .fd = fd,
+            .options = options,
+            .address = address,
+            .peer = peer,
+            .sockaddr = try io_uring.SockAddr.from(address),
+            .deadline = .{
+                .sec = @intCast(options.timeout_ns / std.time.ns_per_s),
+                .nsec = @intCast(options.timeout_ns % std.time.ns_per_s),
+            },
+            .send_buffer = undefined,
+            .send_frame = &.{},
+            .recv_buffer = undefined,
+            .recv_len = 0,
+            .version_received = false,
+            .verack_received = false,
+            .phase = .connecting,
+        };
+    }
+
+    fn run(handshake: *Handshake) !void {
+        try handshake.io.prep_timeout(user_data_timeout, &handshake.deadline);
+        try handshake.io.prep_connect(user_data_io, handshake.fd, &handshake.sockaddr);
+        log.info("connecting to {f}", .{handshake.address});
+
+        var completions: u32 = 0;
+        while (handshake.phase != .complete) : (completions += 1) {
+            if (completions >= completions_max) return error.TooManyCompletions;
+
+            const cqe = try handshake.io.next_completion();
+            if (cqe.user_data == user_data_timeout) return error.Timeout;
+            assert(cqe.user_data == user_data_io);
+
+            try handshake.on_completion(cqe);
+        }
+
+        assert(handshake.version_received);
+        assert(handshake.verack_received);
+        log.info("handshake complete with {f}", .{handshake.address});
+    }
+
+    fn on_completion(handshake: *Handshake, cqe: linux.io_uring_cqe) !void {
+        switch (handshake.phase) {
+            .connecting => {
+                try check_completion(cqe);
+                assert(cqe.res == 0);
+                log.info("tcp connected", .{});
+                try handshake.send_version();
+            },
+            .sending => {
+                try check_completion(cqe);
+                const sent: u32 = @intCast(cqe.res);
+                assert(sent <= handshake.send_frame.len);
+                handshake.send_frame = handshake.send_frame[sent..];
+                if (handshake.send_frame.len > 0) {
+                    // Rare short send: push the remainder before advancing.
+                    try handshake.io.prep_send(user_data_io, handshake.fd, handshake.send_frame);
+                    return;
+                }
+                try handshake.advance();
+            },
+            .receiving => {
+                try check_completion(cqe);
+                const received: u32 = @intCast(cqe.res);
+                if (received == 0) return error.EndOfStream;
+                handshake.recv_len += received;
+                assert(handshake.recv_len <= recv_buffer_len);
+                try handshake.advance();
+            },
+            .complete => unreachable,
+        }
+    }
+
+    /// Drain whatever full messages are buffered, then arm the next SQE.
+    fn advance(handshake: *Handshake) !void {
+        switch (try handshake.pump()) {
+            .complete => handshake.phase = .complete,
+            .awaiting_more => {
+                assert(handshake.recv_len < recv_buffer_len);
+                try handshake.io.prep_recv(
+                    user_data_io,
+                    handshake.fd,
+                    handshake.recv_buffer[handshake.recv_len..],
+                );
+                handshake.phase = .receiving;
+            },
+            .send_verack => {
+                const frame = frame_in_place(&handshake.send_buffer, handshake.options.magic, "verack", 0);
+                try handshake.arm_send(frame);
+                log.info("-> verack", .{});
+            },
+        }
+    }
+
+    fn send_version(handshake: *Handshake) !void {
+        const payload = build_version(
+            handshake.send_buffer[header_len..],
+            handshake.address,
+            handshake.options,
+        );
+        const frame = frame_in_place(
+            &handshake.send_buffer,
+            handshake.options.magic,
+            "version",
+            @intCast(payload.len),
+        );
+        try handshake.arm_send(frame);
+        log.info("-> version (protocol={d}, user_agent={s})", .{
+            handshake.options.protocol_version, handshake.options.user_agent,
+        });
+    }
+
+    fn arm_send(handshake: *Handshake, frame: []const u8) !void {
+        assert(frame.len >= header_len);
+        handshake.send_frame = frame;
+        try handshake.io.prep_send(user_data_io, handshake.fd, frame);
+        handshake.phase = .sending;
+    }
+
+    fn pump(handshake: *Handshake) !PumpResult {
+        while (true) {
+            if (handshake.recv_len < header_len) return .awaiting_more;
+
+            const header = try parse_header(
+                handshake.recv_buffer[0..header_len],
+                handshake.options.magic,
+            );
+            const total = header_len + header.payload_len;
+            if (total > recv_buffer_len) return error.MessageTooLarge;
+            if (handshake.recv_len < total) return .awaiting_more;
+
+            const payload = handshake.recv_buffer[header_len..total];
+            var reply_with_verack = false;
+
+            if (command_eql(&header.command, "version")) {
+                if (header.payload_len > version_payload_max) return error.MessageTooLarge;
+                if (!std.mem.eql(u8, &double_sha256_prefix(payload), &header.checksum)) {
+                    return error.ChecksumMismatch;
+                }
+                try parse_version(handshake.peer, payload);
+                handshake.version_received = true;
+                reply_with_verack = true;
+                log.info("<- version (protocol={d}, services=0x{x}, user_agent={s})", .{
+                    handshake.peer.protocol_version,
+                    handshake.peer.services,
+                    handshake.peer.user_agent(),
+                });
+            } else if (command_eql(&header.command, "verack")) {
+                handshake.verack_received = true;
                 log.info("<- verack", .{});
             } else {
                 log.debug("<- {s} ({d} bytes, ignored)", .{
                     command_name(&header.command), header.payload_len,
                 });
             }
-        }
 
-        if (version_received and verack_received) {
-            assert(peer.user_agent_len <= peer.user_agent_buffer.len);
-            log.info("handshake complete with {s}:{d}", .{ host, port });
-            return;
+            // Drop the consumed message from the front of the buffer.
+            const rest = handshake.recv_len - total;
+            std.mem.copyForwards(
+                u8,
+                handshake.recv_buffer[0..rest],
+                handshake.recv_buffer[total..handshake.recv_len],
+            );
+            handshake.recv_len = rest;
+
+            if (reply_with_verack) return .send_verack;
+            if (handshake.version_received and handshake.verack_received) return .complete;
         }
     }
-
-    assert(messages_seen == messages_max);
-    return error.HandshakeIncomplete;
-}
-
-/// Open a TCP stream to `host:port`. A literal IPv4/IPv6 `host` connects
-/// directly; a DNS name is resolved via `io` and its addresses are dialed in
-/// order until one connects.
-///
-/// There is no connect timeout: `std.Io.Threaded` (0.16.0) panics on a
-/// non-`.none` `ConnectOptions.timeout`, and `HostName.connect`'s concurrent
-/// dial can hang on an unroutable address. Sequential dialing keeps the failure
-/// modes predictable until the io_uring event loop lands.
-fn dial(io: std.Io, host: []const u8, port: u16, family: ?net.IpAddress.Family) !net.Stream {
-    assert(host.len > 0);
-    assert(port != 0);
-
-    const options: net.IpAddress.ConnectOptions = .{ .mode = .stream, .timeout = .none };
-
-    if (net.IpAddress.parse(host, port)) |address| {
-        return address.connect(io, options);
-    } else |_| {
-        // Not a literal address; resolve it below.
-    }
-
-    const name = try net.HostName.init(host);
-    var results_buffer: [dial_addresses_max]net.HostName.LookupResult = undefined;
-    var results: std.Io.Queue(net.HostName.LookupResult) = .init(&results_buffer);
-    try name.lookup(io, &results, .{ .port = port, .family = family });
-
-    var last_error: ?net.IpAddress.ConnectError = null;
-    var addresses_tried: u32 = 0;
-    while (results.getOneUncancelable(io)) |result| {
-        switch (result) {
-            .canonical_name => {},
-            .address => |address| {
-                assert(addresses_tried < dial_addresses_max);
-                addresses_tried += 1;
-                log.debug("dialing {f}", .{address});
-                if (address.connect(io, options)) |stream| {
-                    return stream;
-                } else |err| {
-                    last_error = err;
-                }
-            },
-        }
-    } else |_| {
-        // Queue closed: the lookup finished producing results.
-    }
-
-    if (addresses_tried == 0) return error.UnknownHostName;
-    return last_error orelse error.ConnectionRefused;
-}
+};
 
 const Header = struct {
     command: [command_len]u8,
@@ -240,116 +350,63 @@ const Header = struct {
     checksum: [checksum_len]u8,
 };
 
-/// Read and validate a 24-byte message header. The payload is left unread; the
-/// caller consumes exactly `payload_len` bytes before the next call.
-fn read_header(stream_reader: *net.Stream.Reader, magic: u32) !Header {
-    assert(magic != 0);
-    const reader = &stream_reader.interface;
+const HeaderError = error{ MagicMismatch, MessageTooLarge };
 
-    const magic_found = reader.takeInt(u32, .little) catch |err|
-        return read_err(stream_reader, err);
+/// Parse a 24-byte message header from `bytes`.
+fn parse_header(bytes: *const [header_len]u8, magic: u32) HeaderError!Header {
+    assert(magic != 0);
+
+    const magic_found = std.mem.readInt(u32, bytes[magic_offset..][0..magic_len], .little);
     if (magic_found != magic) return error.MagicMismatch;
 
-    // takeArray points into the reader's buffer; copy out before the next take
-    // can rebase it.
-    const command = (reader.takeArray(command_len) catch |err|
-        return read_err(stream_reader, err)).*;
-    const payload_len = reader.takeInt(u32, .little) catch |err|
-        return read_err(stream_reader, err);
-    const checksum = (reader.takeArray(checksum_len) catch |err|
-        return read_err(stream_reader, err)).*;
-
+    const payload_len = std.mem.readInt(u32, bytes[length_offset..][0..length_len], .little);
     if (payload_len > message_payload_max) return error.MessageTooLarge;
     assert(payload_len <= message_payload_max);
-    return .{ .command = command, .payload_len = payload_len, .checksum = checksum };
+
+    var header: Header = .{ .command = undefined, .payload_len = payload_len, .checksum = undefined };
+    @memcpy(&header.command, bytes[command_offset..][0..command_len]);
+    @memcpy(&header.checksum, bytes[checksum_offset..][0..checksum_len]);
+    return header;
 }
 
-/// Read a `version` payload into `scratch`, verify its checksum, and parse it
-/// into `peer`.
-fn receive_version(
-    peer: *PeerInfo,
-    stream_reader: *net.Stream.Reader,
-    header: *const Header,
-    scratch: []u8,
-) !void {
-    assert(command_eql(&header.command, "version"));
-    assert(scratch.len == version_payload_max);
-
-    if (header.payload_len > scratch.len) return error.MessageTooLarge;
-    assert(header.payload_len <= scratch.len);
-
-    const payload = scratch[0..header.payload_len];
-    stream_reader.interface.readSliceAll(payload) catch |err|
-        return read_err(stream_reader, err);
-
-    if (!std.mem.eql(u8, &double_sha256_prefix(payload), &header.checksum)) {
-        return error.ChecksumMismatch;
-    }
-    try parse_version(peer, payload);
-}
-
-const ReadError = net.Stream.Reader.Error || error{ EndOfStream, ReadFailed };
-
-/// Replace the reader interface's opaque failure with the concrete socket error
-/// the stream recorded, so callers see a cause rather than `ReadFailed`.
-fn read_err(stream_reader: *net.Stream.Reader, err: error{ ReadFailed, EndOfStream }) ReadError {
-    if (err == error.EndOfStream) return error.EndOfStream;
-    assert(err == error.ReadFailed);
-    return stream_reader.err orelse error.ReadFailed;
-}
-
-const WriteError = net.Stream.Writer.Error || error{WriteFailed};
-
-fn write_err(stream_writer: *net.Stream.Writer) WriteError {
-    return stream_writer.err orelse error.WriteFailed;
-}
-
-fn write_message(
-    stream_writer: *net.Stream.Writer,
-    magic: u32,
-    command: []const u8,
-    payload: []const u8,
-) WriteError!void {
+/// Write a 24-byte header into `buffer[0..header_len]` for a payload already
+/// sitting at `buffer[header_len..][0..payload_len]`. Returns the framed message.
+fn frame_in_place(buffer: []u8, magic: u32, command: []const u8, payload_len: u32) []const u8 {
     assert(magic != 0);
     assert(command.len > 0);
     assert(command.len <= command_len);
-    assert(payload.len <= message_payload_max);
+    assert(payload_len <= message_payload_max);
+    assert(buffer.len >= header_len + @as(usize, payload_len));
 
-    var header: [header_len]u8 = undefined;
-    std.mem.writeInt(u32, header[magic_offset..][0..magic_len], magic, .little);
-    @memset(header[command_offset..][0..command_len], 0);
-    @memcpy(header[command_offset..][0..command.len], command);
-    std.mem.writeInt(u32, header[length_offset..][0..length_len], @intCast(payload.len), .little);
-    @memcpy(header[checksum_offset..][0..checksum_len], &double_sha256_prefix(payload));
+    const payload = buffer[header_len..][0..payload_len];
+    std.mem.writeInt(u32, buffer[magic_offset..][0..magic_len], magic, .little);
+    @memset(buffer[command_offset..][0..command_len], 0);
+    @memcpy(buffer[command_offset..][0..command.len], command);
+    std.mem.writeInt(u32, buffer[length_offset..][0..length_len], payload_len, .little);
+    @memcpy(buffer[checksum_offset..][0..checksum_len], &double_sha256_prefix(payload));
 
-    const writer = &stream_writer.interface;
-    writer.writeAll(&header) catch return write_err(stream_writer);
-    writer.writeAll(payload) catch return write_err(stream_writer);
-    writer.flush() catch return write_err(stream_writer);
+    return buffer[0 .. header_len + @as(usize, payload_len)];
 }
 
 /// Serialize our `version` payload into `buffer` and return the written prefix.
 /// `buffer` must hold at least `version_payload_max` bytes; the writes below
 /// then cannot overflow, hence `catch unreachable`.
-fn build_version(io: std.Io, buffer: []u8, peer_port: u16, options: Options) []const u8 {
+fn build_version(buffer: []u8, address: net.IpAddress, options: Options) []const u8 {
     assert(buffer.len >= version_payload_max);
     assert(options.user_agent.len > 0);
     assert(options.user_agent.len <= max_user_agent_len);
 
     var writer = std.Io.Writer.fixed(buffer);
-    const timestamp_seconds: i64 = std.Io.Timestamp.now(io, .real).toSeconds();
-
-    // Non-cryptographic randomness is fine: the nonce only lets a node detect a
-    // connection to itself.
     var nonce: [8]u8 = undefined;
-    io.random(&nonce);
+    fill_nonce(&nonce);
+    const peer_port = net.IpAddress.getPort(address);
 
     writer.writeInt(i32, options.protocol_version, .little) catch unreachable;
     writer.writeInt(u64, options.services, .little) catch unreachable;
-    writer.writeInt(i64, timestamp_seconds, .little) catch unreachable;
+    writer.writeInt(i64, unix_seconds(), .little) catch unreachable;
 
-    // addr_recv: the peer's address. Services and IP zeroed (the peer ignores
-    // them here); port is the one we dialed, in network byte order.
+    // addr_recv: the peer. Services and IP zeroed (the peer ignores them here);
+    // port is the one we dialed, in network byte order.
     writer.writeInt(u64, 0, .little) catch unreachable;
     writer.splatByteAll(0, 16) catch unreachable;
     writer.writeInt(u16, peer_port, .big) catch unreachable;
@@ -474,6 +531,45 @@ fn command_name(command: *const [command_len]u8) []const u8 {
     return command[0..end];
 }
 
+fn unix_seconds() i64 {
+    var now: linux.timespec = undefined;
+    const rc = linux.clock_gettime(.REALTIME, &now);
+    assert(linux.errno(rc) == .SUCCESS);
+    return @intCast(now.sec);
+}
+
+fn fill_nonce(nonce: *[8]u8) void {
+    const rc = linux.getrandom(nonce, nonce.len, 0);
+    if (linux.errno(rc) == .SUCCESS and rc == nonce.len) return;
+
+    // getrandom unavailable (old kernel or seccomp). The nonce only lets a node
+    // notice a connection to itself, so a clock-seeded PRNG is sufficient.
+    var seed: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &seed);
+    var prng = std.Random.DefaultPrng.init(
+        @as(u64, @bitCast(@as(i64, seed.sec))) ^
+            (@as(u64, @bitCast(@as(i64, seed.nsec))) *% 0x9e37_79b9_7f4a_7c15),
+    );
+    prng.random().bytes(nonce);
+}
+
+/// Map a failed CQE (`res` < 0) to an error.
+fn check_completion(cqe: linux.io_uring_cqe) !void {
+    if (cqe.res >= 0) return;
+    switch (cqe.err()) {
+        .CONNREFUSED => return error.ConnectionRefused,
+        .TIMEDOUT => return error.Timeout,
+        .NETUNREACH, .NETDOWN => return error.NetworkUnreachable,
+        .HOSTUNREACH => return error.HostUnreachable,
+        .CONNRESET, .PIPE => return error.ConnectionResetByPeer,
+        .CANCELED => return error.Canceled,
+        else => |errno| {
+            log.err("io_uring op failed: {t}", .{errno});
+            return error.Unexpected;
+        },
+    }
+}
+
 test "compact size: encode then decode round-trips across size-class boundaries" {
     // For each value on or beside a size-class boundary: encode it, decode the
     // bytes back, and check both the value and that decoding consumed exactly
@@ -511,6 +607,26 @@ test "command matching: exact name, NUL padding tolerated, mismatch rejected" {
     try std.testing.expect(!command_eql(&command, "verack"));
     try std.testing.expect(!command_eql(&command, "versio"));
     try std.testing.expectEqualStrings("version", command_name(&command));
+}
+
+test "frame_in_place then parse_header round-trips a verack" {
+    var buffer: [frame_buffer_len]u8 = undefined;
+    const frame = frame_in_place(&buffer, mainnet_magic, "verack", 0);
+    try std.testing.expectEqual(@as(usize, header_len), frame.len);
+
+    const header = try parse_header(frame[0..header_len], mainnet_magic);
+    try std.testing.expectEqual(@as(u32, 0), header.payload_len);
+    try std.testing.expect(command_eql(&header.command, "verack"));
+    try std.testing.expectEqualSlices(u8, &.{ 0x5d, 0xf6, 0xe0, 0xe2 }, &header.checksum);
+}
+
+test "parse_header rejects the wrong network magic" {
+    var buffer: [frame_buffer_len]u8 = undefined;
+    const frame = frame_in_place(&buffer, mainnet_magic, "verack", 0);
+    try std.testing.expectError(
+        error.MagicMismatch,
+        parse_header(frame[0..header_len], testnet3_magic),
+    );
 }
 
 test "parse_version: extracts fields from a well-formed payload" {
