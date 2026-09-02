@@ -1,0 +1,4 @@
+{
+    "$schema": "https://raw.githubusercontent.com/zigtools/zls/master/schema.json",
+    "warn_style": false
+}
