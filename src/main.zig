@@ -28,11 +28,11 @@ const seed_addresses_max = 32;
 /// Addresses a single DNS-seed lookup may contribute.
 const dns_addresses_max = 32;
 /// io_uring SQ depth, sized so `connect_all` never fills the queue.
-const ring_entries = 128;
+const ring_entries = 256;
 
 comptime {
     assert(std.math.isPowerOfTwo(ring_entries));
-    assert(ring_entries >= handshake.min_ring_entries(concurrency));
+    assert(ring_entries >= handshake.min_ring_entries(concurrency, seed_addresses_max));
     assert(concurrency >= 1);
     assert(handshake_target >= 1);
     assert(handshake_target <= seed_addresses_max);
@@ -60,13 +60,16 @@ pub fn main(init: std.process.Init) !void {
     var io: io_uring.IO = try .init(ring_entries);
     defer io.deinit();
 
-    var file = Io.Dir.cwd().createFile(init.io, log_path, .{}) catch |err| {
+    var log_file = Io.Dir.cwd().createFile(init.io, log_path, .{}) catch |err| {
         log.err("create {s}: {t}", .{ log_path, err });
         return err;
     };
-    defer file.close(init.io);
-    var file_buffer: [512]u8 = undefined;
-    var file_writer = file.writer(init.io, &file_buffer);
+    defer log_file.close(init.io);
+
+    // One record line per dialed address, written onto `io` as `IORING_OP_WRITE`s
+    // so the crawl loop never blocks on the log file.
+    var log_lines: [seed_addresses_max]handshake.PeerLog.Line = undefined;
+    var peer_log = handshake.PeerLog.init(&io, log_file.handle, log_lines[0..addresses.len]);
 
     // Every handshake runs on this one ring, identified by a pointer stored in
     // its SQE `user_data`; `connect_all` returns with the ring drained, having
@@ -74,14 +77,16 @@ pub fn main(init: std.process.Init) !void {
     var slots: [concurrency]handshake.Handshake = undefined;
     const summary = handshake.connect_all(
         &io,
-        &file_writer.interface,
+        &peer_log,
         addresses,
         slots[0..],
         handshake_target,
         .{},
     );
 
-    log.info("wrote {s}: {d} ok / {d} dialed", .{ log_path, summary.succeeded, summary.dialed });
+    log.info("wrote {s}: {d} ok / {d} dialed, {d} record(s) dropped", .{
+        log_path, summary.succeeded, summary.dialed, summary.dropped,
+    });
     if (summary.succeeded == 0) return error.AllHandshakesFailed;
     if (summary.succeeded < handshake_target) {
         log.warn("only {d} of {d} target handshakes succeeded", .{ summary.succeeded, handshake_target });

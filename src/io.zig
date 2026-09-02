@@ -51,6 +51,21 @@ pub const IO = struct {
         _ = try io.ring.recv(user_data, fd, .{ .buffer = buffer }, 0);
     }
 
+    /// `buffer` must stay valid until this write's CQE is reaped; `offset` is the
+    /// absolute file position to write at, so out-of-order completions still land
+    /// their bytes in the right place.
+    pub fn prep_write(io: *IO, user_data: u64, fd: linux.fd_t, buffer: []const u8, offset: u64) !void {
+        assert(user_data != 0);
+        assert(buffer.len > 0);
+        _ = try io.ring.write(user_data, fd, buffer, offset);
+    }
+
+    /// Close `fd` on the ring; the close reports through its own CQE.
+    pub fn prep_close(io: *IO, user_data: u64, fd: linux.fd_t) !void {
+        assert(user_data != 0);
+        _ = try io.ring.close(user_data, fd);
+    }
+
     /// `deadline` must stay valid until the timeout completes or the ring is
     /// torn down; the kernel reads it after submission.
     pub fn prep_timeout(io: *IO, user_data: u64, deadline: *const linux.kernel_timespec) !void {
@@ -127,6 +142,9 @@ pub const SocketError = error{
 
 /// Create a blocking TCP socket for `address`'s family. io_uring makes the
 /// operations on it asynchronous regardless of the socket's blocking mode.
+///
+/// The matching teardown is `IO.prep_close` on the ring; `close_socket` below is
+/// only the synchronous fallback for a socket abandoned before any SQE armed.
 pub fn open_socket(address: net.IpAddress) (SocketError || SockAddr.FromError)!linux.fd_t {
     const domain: u32 = switch (address) {
         .ip4 => linux.AF.INET,

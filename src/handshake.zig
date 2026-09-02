@@ -7,8 +7,10 @@
 //! `Completion`s as its `user_data`, so a CQE names both the handshake and which
 //! op finished; a slot stays alive until its outstanding completions drain, so
 //! nothing needs a synchronous ring scrub between handshakes. Nothing is
-//! allocated: the caller owns the slot pool. As each handshake settles,
-//! `connect_all` writes one line to a caller-supplied sink describing that peer.
+//! allocated: the caller owns the slot pool and the `PeerLog` line buffers. As
+//! each handshake settles, `connect_all` queues one `IORING_OP_WRITE` on the
+//! same ring appending that peer's one-line record to the caller's log file, so
+//! the crawl loop never blocks on the log.
 //!
 //! The wire format is a 24-byte header (magic, 12-byte command, payload length,
 //! truncated double-SHA256 checksum) followed by the payload.
@@ -66,12 +68,14 @@ const completions_max = 64;
 
 /// Per-handshake SQE identities. Each is a distinct `user_data` (a pointer into
 /// `Handshake.completions`) so a CQE names both the handshake and which of its
-/// SQEs completed: the in-flight I/O op, the deadline timer, and the
-/// cancel/remove op that retires whichever of those outlives the handshake.
+/// SQEs completed: the in-flight I/O op, the deadline timer, the cancel/remove
+/// op that retires whichever of those outlives the handshake, and the socket
+/// close that runs once the outcome is final.
 const completion_io = 0;
 const completion_timeout = 1;
 const completion_cancel = 2;
-const completion_count = 3;
+const completion_close = 3;
+const completion_count = 4;
 
 comptime {
     assert(header_len == 24);
@@ -82,7 +86,7 @@ comptime {
     assert(version_payload_max <= message_payload_max);
     assert(recv_buffer_len >= header_len + version_payload_max);
     assert(frame_buffer_len >= header_len + version_payload_max);
-    assert(completion_count == 3);
+    assert(completion_count == 4);
 }
 
 pub const Options = struct {
@@ -142,12 +146,14 @@ pub const DialError = error{
     Unexpected,
 };
 
-/// Tally returned by `connect_all`. The per-peer detail is in the log sink.
+/// Tally returned by `connect_all`. The per-peer detail is in the `PeerLog`.
 pub const Summary = struct {
     /// Addresses actually dialed (a handshake started, or the socket failed).
     dialed: u32,
     /// Of those, how many completed the version/verack exchange.
     succeeded: u32,
+    /// Record lines that could not be written (a write CQE failed).
+    dropped: u32,
 };
 
 /// Mutable dialing progress shared between `connect_all` and `fill_slot`.
@@ -158,55 +164,201 @@ const Progress = struct {
     succeeded: u32,
 };
 
-/// Write one line for one peer to `sink` and flush it, so the log is complete
-/// and current the moment a handshake settles. A write failure is logged, not
-/// propagated: it must not abort the run.
-fn write_peer_line(
-    sink: *std.Io.Writer,
+/// The IPv4 text form is the widest address we print: `255.255.255.255:65535`.
+const ip_text_max = "255.255.255.255:65535".len;
+
+/// Bytes one record line can occupy. The `ok` form is the widest: address, the
+/// literal fields, and a user agent in which every byte escaped to `\xNN`.
+const line_bytes_max =
+    ip_text_max + "\tok\t".len + "-2147483648".len + "\t0x".len +
+    "ffffffffffffffff".len + "\t".len + 4 * max_user_agent_len + "\n".len;
+
+comptime {
+    // The `fail` form must fit too: address, tag, the longest error name, `\n`.
+    assert(line_bytes_max >= ip_text_max + "\tfail\t".len + "ConnectionResetByPeer".len + 1);
+}
+
+/// One-line-per-peer record file, written straight onto the shared ring so the
+/// crawl loop never blocks on it. Each queued line keeps its own buffer and SQE
+/// identity reserved until its write CQE drains; `connect_all` drains them all
+/// before returning so the caller may close `fd`. Caller-owned, no allocation:
+/// `lines` is backed by a caller array sized to the address count, so a free
+/// slot is always available (no line is ever recycled).
+pub const PeerLog = struct {
+    io: *io_uring.IO,
+    fd: linux.fd_t,
+    lines: []Line,
+    /// Absolute file offset the next queued line writes at. Advanced at submit
+    /// time, so lines land in settle order though writes complete out of order.
+    offset: u64,
+    /// Lines handed out of `lines` so far.
+    used: u32,
+    /// Writes queued on the ring and not yet reaped.
+    in_flight: u32,
+    /// Lines a failed write CQE lost.
+    dropped: u32,
+
+    /// One framed record line: its rendered bytes and the SQE identity for its
+    /// write. `written` tracks progress so a short write re-arms only the tail.
+    pub const Line = struct {
+        completion: Completion,
+        offset: u64,
+        len: u32,
+        written: u32,
+        buffer: [line_bytes_max]u8,
+    };
+
+    pub fn init(io: *io_uring.IO, fd: linux.fd_t, lines: []Line) PeerLog {
+        assert(lines.len >= 1);
+        return .{
+            .io = io,
+            .fd = fd,
+            .lines = lines,
+            .offset = 0,
+            .used = 0,
+            .in_flight = 0,
+            .dropped = 0,
+        };
+    }
+
+    /// Render the record for `address` into a fresh line and queue its write.
+    /// `peer` is required for (and only read on) a successful `outcome`.
+    fn emit(
+        peer_log: *PeerLog,
+        address: net.IpAddress,
+        outcome: DialError!void,
+        peer: ?*const PeerInfo,
+    ) void {
+        assert(peer_log.used < peer_log.lines.len);
+        const line = &peer_log.lines[peer_log.used];
+        peer_log.used += 1;
+
+        var writer = std.Io.Writer.fixed(&line.buffer);
+        format_peer_line(&writer, address, outcome, peer) catch |err| {
+            // `buffer` is sized for the widest line; a failure here is a bug.
+            log.err("render record for {f}: {t}", .{ address, err });
+            peer_log.dropped += 1;
+            return;
+        };
+
+        const rendered = writer.buffered();
+        assert(rendered.len > 0);
+        assert(rendered.len <= line_bytes_max);
+
+        line.completion = .{ .owner = .{ .peer_log = peer_log }, .kind = .log_write };
+        line.offset = peer_log.offset;
+        line.len = @intCast(rendered.len);
+        line.written = 0;
+        peer_log.offset += line.len;
+
+        // The ring is sized (`min_ring_entries`) so the SQ can never be full.
+        peer_log.io.prep_write(
+            user_data_of(&line.completion),
+            peer_log.fd,
+            line.buffer[0..line.len],
+            line.offset,
+        ) catch unreachable;
+        peer_log.in_flight += 1;
+    }
+
+    /// One write CQE landed: advance the line, re-arming its tail on a short
+    /// write and counting a failed write as a dropped line.
+    fn on_write_complete(peer_log: *PeerLog, completion: *Completion, cqe: linux.io_uring_cqe) void {
+        assert(peer_log.in_flight > 0);
+        peer_log.in_flight -= 1;
+
+        const line: *Line = @fieldParentPtr("completion", completion);
+        assert(line.written < line.len);
+
+        if (cqe.res <= 0) {
+            log.err("record write at offset {d} failed: {t}", .{ line.offset, cqe.err() });
+            peer_log.dropped += 1;
+            return;
+        }
+
+        const wrote: u32 = @intCast(cqe.res);
+        assert(wrote <= line.len - line.written);
+        line.written += wrote;
+        if (line.written == line.len) return;
+
+        peer_log.io.prep_write(
+            user_data_of(&line.completion),
+            peer_log.fd,
+            line.buffer[line.written..line.len],
+            line.offset + line.written,
+        ) catch unreachable;
+        peer_log.in_flight += 1;
+    }
+};
+
+fn user_data_of(completion: *const Completion) u64 {
+    return @intCast(@intFromPtr(completion));
+}
+
+/// Render one record line to `writer`: `<addr>\tok\t<version>\t0x<services>\t<ua>`
+/// or `<addr>\tfail\t<error>`, newline-terminated.
+fn format_peer_line(
+    writer: *std.Io.Writer,
     address: net.IpAddress,
     outcome: DialError!void,
     peer: ?*const PeerInfo,
-) void {
-    const printed = if (outcome) |_| blk: {
+) std.Io.Writer.Error!void {
+    if (outcome) |_| {
         assert(peer != null);
-        break :blk sink.print("{f}\tok\t{d}\t0x{x}\t{s}\n", .{
-            address,
-            peer.?.protocol_version,
-            peer.?.services,
-            peer.?.user_agent(),
-        });
-    } else |err| sink.print("{f}\tfail\t{s}\n", .{ address, @errorName(err) });
+        const info = peer.?;
+        try writer.print("{f}\tok\t{d}\t0x{x}\t", .{ address, info.protocol_version, info.services });
+        try write_escaped(writer, info.user_agent());
+        try writer.writeByte('\n');
+    } else |err| {
+        try writer.print("{f}\tfail\t{s}\n", .{ address, @errorName(err) });
+    }
+}
 
-    printed catch |err| {
-        log.err("write peer line for {f}: {t}", .{ address, err });
-        return;
-    };
-    sink.flush() catch |err| log.err("flush peer log: {t}", .{err});
+/// Write `text` with every byte that is not printable ASCII (backslash included)
+/// replaced by a `\xNN` escape. The user agent is peer-supplied and untrusted;
+/// this keeps a hostile peer from injecting tabs, newlines, or control bytes
+/// into the tab-separated record.
+fn write_escaped(writer: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
+    assert(text.len <= max_user_agent_len);
+    for (text) |byte| {
+        if (byte >= 0x20 and byte < 0x7f and byte != '\\') {
+            try writer.writeByte(byte);
+        } else {
+            try writer.print("\\x{x:0>2}", .{byte});
+        }
+    }
 }
 
 /// CQEs `connect_all` copies out of the ring per loop iteration.
 const reap_batch = 32;
 
 /// Smallest shared-ring SQ depth `connect_all` is safe to run on: every SQE it
-/// can queue between two submits — one new I/O op and one cancel per reaped CQE,
-/// plus the initial timer + connect for every pool slot.
-pub fn min_ring_entries(pool_slots: usize) usize {
-    return 2 * reap_batch + completion_count * pool_slots;
+/// can queue before the next submit. Per reaped CQE it may queue a new I/O op, a
+/// cancel, a socket close, and a record write, so budget `4 * reap_batch`; the
+/// pool's own timer/connect/cancel/close identities add `completion_count` per
+/// slot; and a run in which every socket fails to open queues one record write
+/// per address before the first submit, so budget `address_count` for those.
+pub fn min_ring_entries(pool_slots: usize, address_count: usize) usize {
+    return 4 * reap_batch + completion_count * pool_slots + address_count;
 }
 
 /// Handshake every address in `addresses`, keeping up to `slots.len` in flight
 /// at once on the shared `io` ring, and stop starting new ones once `target`
-/// have succeeded. Writes exactly one line to `sink` per dialed peer, at the
-/// moment that peer's handshake settles. `slots` is caller-owned; nothing is
+/// have succeeded. Queues exactly one `peer_log` record write per dialed peer,
+/// at the moment that peer's handshake settles, and drains those writes before
+/// returning. `slots` and the `peer_log` buffers are caller-owned; nothing is
 /// allocated.
 pub fn connect_all(
     io: *io_uring.IO,
-    sink: *std.Io.Writer,
+    peer_log: *PeerLog,
     addresses: []const net.IpAddress,
     slots: []Handshake,
     target: u32,
     options: Options,
 ) Summary {
+    assert(addresses.len >= 1);
+    assert(addresses.len <= std.math.maxInt(u32));
+    assert(addresses.len <= peer_log.lines.len);
     assert(slots.len >= 1);
     assert(target >= 1);
     assert(options.magic != 0);
@@ -217,7 +369,7 @@ pub fn connect_all(
     for (slots) |*slot| slot.status = .idle;
 
     var progress: Progress = .{ .next = 0, .dialed = 0, .succeeded = 0 };
-    for (slots) |*slot| fill_slot(io, sink, slot, addresses, &progress, target, options);
+    for (slots) |*slot| fill_slot(io, peer_log, slot, addresses, &progress, target, options);
 
     var cqes: [reap_batch]linux.io_uring_cqe = undefined;
     while (any_busy(slots)) {
@@ -227,46 +379,81 @@ pub fn connect_all(
         };
         for (cqes[0..count]) |cqe| {
             const completion: *Completion = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
-            const slot = completion.handshake;
-            slot.on_completion(completion.kind, cqe);
-            if (slot.status != .settled) continue;
+            switch (completion.owner) {
+                .peer_log => |sink| sink.on_write_complete(completion, cqe),
+                .handshake => |slot| {
+                    slot.on_completion(completion.kind, cqe);
+                    if (slot.status != .settled) continue;
 
-            io_uring.close_socket(slot.fd);
-            write_peer_line(sink, slot.address, slot.outcome, &slot.peer);
-            progress.dialed += 1;
-            if (slot.outcome) |_| {
-                progress.succeeded += 1;
-            } else |_| {}
-            slot.status = .idle;
-            fill_slot(io, sink, slot, addresses, &progress, target, options);
+                    peer_log.emit(slot.address, slot.outcome, &slot.peer);
+                    progress.dialed += 1;
+                    if (slot.outcome) |_| {
+                        progress.succeeded += 1;
+                    } else |_| {}
+                    slot.status = .idle;
+                    fill_slot(io, peer_log, slot, addresses, &progress, target, options);
+                },
+            }
         }
     }
 
-    return .{ .dialed = progress.dialed, .succeeded = progress.succeeded };
+    drain_peer_log(io, peer_log, &cqes);
+
+    return .{
+        .dialed = progress.dialed,
+        .succeeded = progress.succeeded,
+        .dropped = peer_log.dropped,
+    };
+}
+
+/// Every handshake has settled; keep submitting until the last queued record
+/// write has completed, so the caller may safely close the log file.
+fn drain_peer_log(io: *io_uring.IO, peer_log: *PeerLog, cqes: []linux.io_uring_cqe) void {
+    // Each pass reaps >= 1 CQE and only a short write re-adds one; the bound is
+    // generous cover for that.
+    const pass_max = 1024;
+    var pass: u32 = 0;
+    while (peer_log.in_flight > 0) {
+        pass += 1;
+        assert(pass <= pass_max);
+        const count = io.submit_and_reap(cqes) catch |err| {
+            log.err("peer-log drain failed: {t}; {d} write(s) abandoned", .{ err, peer_log.in_flight });
+            return;
+        };
+        for (cqes[0..count]) |cqe| {
+            const completion: *Completion = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
+            switch (completion.owner) {
+                .peer_log => |sink| sink.on_write_complete(completion, cqe),
+                .handshake => unreachable, // every slot settled before draining
+            }
+        }
+    }
 }
 
 fn any_busy(slots: []const Handshake) bool {
-    for (slots) |*slot| {
-        if (slot.status == .dialing or slot.status == .winding) return true;
-    }
+    for (slots) |*slot| switch (slot.status) {
+        .dialing, .winding, .closing => return true,
+        .idle, .settled => {},
+    };
     return false;
 }
 
 fn busy_count(slots: []const Handshake) u32 {
     var n: u32 = 0;
-    for (slots) |*slot| {
-        if (slot.status == .dialing or slot.status == .winding) n += 1;
-    }
+    for (slots) |*slot| switch (slot.status) {
+        .dialing, .winding, .closing => n += 1,
+        .idle, .settled => {},
+    };
     return n;
 }
 
 /// Take addresses off the front of the queue until one handshake starts on
 /// `slot`, or there is nothing left to dial (`target` reached or list
 /// exhausted), leaving the slot `.idle`. A socket that will not open or start
-/// gets its one `sink` line here and counts as dialed.
+/// gets its one `peer_log` record here and counts as dialed.
 fn fill_slot(
     io: *io_uring.IO,
-    sink: *std.Io.Writer,
+    peer_log: *PeerLog,
     slot: *Handshake,
     addresses: []const net.IpAddress,
     progress: *Progress,
@@ -274,20 +461,21 @@ fn fill_slot(
     options: Options,
 ) void {
     assert(slot.status == .idle);
-    while (progress.succeeded < target and progress.next < addresses.len) {
+    const address_count: u32 = @intCast(addresses.len);
+    while (progress.succeeded < target and progress.next < address_count) {
         const address = addresses[progress.next];
         progress.next += 1;
 
         const fd = io_uring.open_socket(address) catch |err| {
-            log.debug("open socket for {f}: {t}", .{ address, err });
-            write_peer_line(sink, address, error.SocketUnavailable, null);
+            log.warn("open socket for {f}: {t}", .{ address, err });
+            peer_log.emit(address, error.SocketUnavailable, null);
             progress.dialed += 1;
             continue;
         };
         slot.start(io, fd, address, options) catch |err| {
-            log.debug("start handshake with {f}: {t}", .{ address, err });
-            io_uring.close_socket(fd);
-            write_peer_line(sink, address, error.SocketUnavailable, null);
+            log.warn("start handshake with {f}: {t}", .{ address, err });
+            io_uring.close_socket(fd); // no SQE armed yet: synchronous close
+            peer_log.emit(address, error.SocketUnavailable, null);
             progress.dialed += 1;
             continue;
         };
@@ -296,10 +484,14 @@ fn fill_slot(
 }
 
 const Completion = struct {
-    handshake: *Handshake,
+    owner: Owner,
     kind: Kind,
 
-    const Kind = enum { io, timeout, cancel };
+    const Owner = union(enum) {
+        handshake: *Handshake,
+        peer_log: *PeerLog,
+    };
+    const Kind = enum { io, timeout, cancel, close, log_write };
 };
 
 pub const Handshake = struct {
@@ -343,8 +535,9 @@ pub const Handshake = struct {
     /// - `idle`    unused, ready for `fill_slot`
     /// - `dialing` handshake running, outcome not yet known
     /// - `winding` outcome decided; still draining the cancelled SQE(s)
+    /// - `closing` outcome final; the socket close is in flight on the ring
     /// - `settled` `in_flight == 0`, `outcome` / `peer` final, ready to recycle
-    const Status = enum { idle, dialing, winding, settled };
+    const Status = enum { idle, dialing, winding, closing, settled };
     const Phase = enum { connecting, sending, receiving, complete };
     const PumpResult = enum { awaiting_more, send_verack, complete };
     const ArmOp = enum { timeout, connect, send, recv };
@@ -368,9 +561,10 @@ pub const Handshake = struct {
             .outcome = {},
             .peer = undefined,
             .completions = .{
-                .{ .handshake = slot, .kind = .io },
-                .{ .handshake = slot, .kind = .timeout },
-                .{ .handshake = slot, .kind = .cancel },
+                .{ .owner = .{ .handshake = slot }, .kind = .io },
+                .{ .owner = .{ .handshake = slot }, .kind = .timeout },
+                .{ .owner = .{ .handshake = slot }, .kind = .cancel },
+                .{ .owner = .{ .handshake = slot }, .kind = .close },
             },
             .in_flight = 0,
             .seen = 0,
@@ -423,8 +617,18 @@ pub const Handshake = struct {
         switch (slot.status) {
             .idle, .settled => unreachable,
             .winding => {
-                // Outcome already decided; just drain the cancelled SQE(s).
-                if (slot.in_flight == 0) slot.status = .settled;
+                // Outcome already decided; drain the cancelled SQE(s), then
+                // hand the socket close to the ring and wait on its CQE too.
+                if (slot.in_flight == 0) {
+                    slot.io.prep_close(slot.tag(completion_close), slot.fd) catch unreachable;
+                    slot.in_flight = 1;
+                    slot.status = .closing;
+                }
+            },
+            .closing => {
+                assert(kind == .close);
+                assert(slot.in_flight == 0);
+                slot.status = .settled;
             },
             .dialing => slot.step(kind, cqe),
         }
@@ -437,6 +641,8 @@ pub const Handshake = struct {
         if (slot.seen > completions_max) return slot.finish(error.TooManyCompletions, kind);
         switch (kind) {
             .cancel => unreachable, // only issued once status is .winding
+            .close => unreachable, // only issued once status is .closing
+            .log_write => unreachable, // owned by PeerLog, never a handshake
             .timeout => return slot.finish(error.Timeout, kind),
             .io => {},
         }
@@ -903,4 +1109,37 @@ test "parse_version: extracts fields from a well-formed payload" {
 test "parse_version: rejects a payload shorter than the fixed prefix" {
     var peer: PeerInfo = undefined;
     try std.testing.expectError(error.MalformedVersion, parse_version(&peer, &[_]u8{0} ** 40));
+}
+
+test "write_escaped: neutralises tab, newline, and backslash in a user agent" {
+    var buffer: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try write_escaped(&writer, "/ok\t\n\\\x7f/");
+    try std.testing.expectEqualStrings("/ok\\x09\\x0a\\x5c\\x7f/", writer.buffered());
+}
+
+test "format_peer_line: ok record is one escaped tab-separated line" {
+    var peer: PeerInfo = std.mem.zeroes(PeerInfo);
+    peer.protocol_version = 70016;
+    peer.services = 0x409;
+    const ua = "/Satoshi:27.0.0/\t/evil/";
+    @memcpy(peer.user_agent_buffer[0..ua.len], ua);
+    peer.user_agent_len = ua.len;
+
+    var buffer: [line_bytes_max]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    const address: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 1, 2, 3, 4 }, .port = 8333 } };
+    try format_peer_line(&writer, address, {}, &peer);
+    try std.testing.expectEqualStrings(
+        "1.2.3.4:8333\tok\t70016\t0x409\t/Satoshi:27.0.0/\\x09/evil/\n",
+        writer.buffered(),
+    );
+}
+
+test "format_peer_line: failed dial records the error name" {
+    var buffer: [line_bytes_max]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    const address: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 1 }, .port = 8333 } };
+    try format_peer_line(&writer, address, error.ConnectionRefused, null);
+    try std.testing.expectEqualStrings("10.0.0.1:8333\tfail\tConnectionRefused\n", writer.buffered());
 }
