@@ -33,5 +33,6 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = @import("handshake.zig");
+    _ = @import("io.zig");
     _ = @import("seeds.zig");
 }
