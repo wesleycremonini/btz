@@ -1,4 +1,4 @@
-# btc-crawler
+# btz
 
 A Zig project. Currently a hello-world scaffold.
 

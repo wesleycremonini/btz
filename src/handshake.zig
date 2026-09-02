@@ -84,7 +84,7 @@ pub const Options = struct {
     /// Service bits to advertise. 0 = NODE_NONE: we serve nothing, we crawl.
     services: u64 = 0,
     /// User agent string (BIP-14).
-    user_agent: []const u8 = "/btc-crawler:0.1.0/",
+    user_agent: []const u8 = "/btz:0.1.0/",
     /// Network magic.
     magic: u32 = mainnet_magic,
     /// Whole-handshake deadline in nanoseconds.

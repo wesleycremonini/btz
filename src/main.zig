@@ -26,7 +26,7 @@ pub fn main(init: std.process.Init) !void {
     handshake.connect(&peer, &io, address, .{
         .protocol_version = 70016,
         .services = 0,
-        .user_agent = "/btc-crawler:0.1.0/",
+        .user_agent = "/btz:0.1.0/",
         .magic = handshake.mainnet_magic,
         .timeout_ns = 10 * std.time.ns_per_s,
     }) catch |err| {
