@@ -7,7 +7,7 @@ const handshake = @import("handshake.zig");
 const crawl = @import("crawl.zig");
 const io_uring = @import("io.zig");
 const seeds = @import("seeds.zig");
-const PeerLog = crawl.PeerLog;
+const PeerLog = @import("peer_log.zig").PeerLog;
 const log = std.log.scoped(.main);
 
 /// One line per dialed peer is written here; truncated at the start of each run.
@@ -29,12 +29,13 @@ const handshake_target = 4;
 const seed_addresses_max = 32;
 /// Addresses a single DNS-seed lookup may contribute.
 const dns_addresses_max = 32;
-/// io_uring SQ depth, sized so `connect_all` rarely parks a completion.
+/// io_uring SQ depth. Each of `concurrency` handshakes holds only a few SQEs
+/// and each settling one queues a record write, so 256 is roomy; an undersized
+/// ring only makes `IO` park the overflow on its unqueued list, never fail.
 const ring_entries = 256;
 
 comptime {
     assert(std.math.isPowerOfTwo(ring_entries));
-    assert(ring_entries >= crawl.min_ring_entries(concurrency));
     assert(concurrency >= 1);
     assert(handshake_target >= 1);
     assert(handshake_target <= seed_addresses_max);
@@ -146,6 +147,7 @@ fn collect_seed_addresses(
 test {
     _ = @import("message.zig");
     _ = @import("version.zig");
+    _ = @import("peer.zig");
     _ = @import("handshake.zig");
     _ = @import("peer_log.zig");
     _ = @import("crawl.zig");

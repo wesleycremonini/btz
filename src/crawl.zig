@@ -18,9 +18,9 @@ const io_uring = @import("io.zig");
 const handshake = @import("handshake.zig");
 const version = @import("version.zig");
 const Handshake = handshake.Handshake;
+const PeerLog = @import("peer_log.zig").PeerLog;
+const max_user_agent_len = @import("peer.zig").max_user_agent_len;
 const log = std.log.scoped(.p2p);
-
-pub const PeerLog = @import("peer_log.zig").PeerLog;
 
 /// Tally returned by `connect_all`. The per-peer detail is in the `PeerLog`.
 pub const Summary = struct {
@@ -45,14 +45,6 @@ const Progress = struct {
 /// from this so a stuck loop trips an assert rather than spinning forever.
 const cqes_per_dial_max = 128;
 
-/// A comfortable shared-ring SQ depth: enough that `connect_all` rarely has to
-/// park a completion on `IO.unqueued`. Each in-flight handshake can hold
-/// `completion_count` SQEs, and each settling one queues a `peer_log` write.
-pub fn min_ring_entries(pool_slots: u32) u32 {
-    assert(pool_slots >= 1);
-    return handshake.completion_count * pool_slots + pool_slots;
-}
-
 /// Handshake addresses from `addresses`, keeping up to `slots.len` in flight at
 /// once on the shared `io` ring, and stop starting new ones once `target` have
 /// succeeded. Queues exactly one `peer_log` record write per dialed peer, at the
@@ -74,7 +66,7 @@ pub fn connect_all(
     assert(target >= 1);
     assert(options.magic != 0);
     assert(options.user_agent.len > 0);
-    assert(options.user_agent.len <= version.max_user_agent_len);
+    assert(options.user_agent.len <= max_user_agent_len);
     assert(options.timeout_ns > 0);
 
     for (slots) |*slot| slot.status = .idle;

@@ -21,7 +21,8 @@ const io_uring = @import("io.zig");
 const message = @import("message.zig");
 const version = @import("version.zig");
 const Options = version.Options;
-const PeerInfo = version.PeerInfo;
+const DialError = @import("peer.zig").DialError;
+const PeerInfo = @import("peer.zig").PeerInfo;
 const header_len = message.header_len;
 const log = std.log.scoped(.p2p);
 
@@ -46,45 +47,15 @@ const completion_timeout = 1;
 const completion_cancel = 2;
 const completion_close = 3;
 
-/// Per-slot `io_uring.Completion` count. `crawl.min_ring_entries` budgets SQEs
-/// against it.
-pub const completion_count = 4;
+/// Per-slot `io_uring.Completion` count: the live I/O op, the deadline timer,
+/// the cancel/remove that retires the survivor, and the socket close.
+const completion_count = 4;
 
 comptime {
     assert(recv_buffer_len >= header_len + version.version_payload_max);
     assert(frame_buffer_len >= header_len + version.version_payload_max);
     assert(completion_count == 4);
 }
-
-pub const DialError = error{
-    /// A message did not begin with the expected network magic.
-    MagicMismatch,
-    /// The peer's `version` checksum did not match its payload.
-    ChecksumMismatch,
-    /// A length field, or a `version`, exceeded what we will buffer.
-    MessageTooLarge,
-    /// The peer's `version` payload was too short or internally inconsistent.
-    MalformedVersion,
-    /// The peer closed the connection mid-handshake.
-    EndOfStream,
-    /// The handshake did not finish within `Options.timeout_ns`.
-    Timeout,
-    /// `completions_max` completions passed without the handshake finishing.
-    TooManyCompletions,
-    /// The connect / send / recv SQE failed at the transport layer.
-    ConnectionRefused,
-    ConnectionResetByPeer,
-    NetworkUnreachable,
-    HostUnreachable,
-    /// The kernel cancelled the operation.
-    Canceled,
-    /// The socket could not be created or started for this address.
-    SocketUnavailable,
-    /// The address was never dialed: `target` was reached, or the run ended.
-    Skipped,
-    /// An unclassified io_uring failure; see the log.
-    Unexpected,
-};
 
 pub const Handshake = struct {
     io: *io_uring.IO,
@@ -180,8 +151,8 @@ pub const Handshake = struct {
     }
 
     /// Queue one SQE and count it against `in_flight`. The shared ring is sized
-    /// (`min_ring_entries`) so the SQ is not normally full; `IO` parks the
-    /// completion and retries it next tick if it is.
+    /// so the SQ is not normally full; if it is, `IO` parks the completion and
+    /// retries it on the next tick.
     fn arm(slot: *Handshake, comptime op: ArmOp) void {
         switch (op) {
             .timeout => slot.io.timeout(

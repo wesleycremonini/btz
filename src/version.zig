@@ -10,9 +10,8 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const net = std.Io.net;
 const message = @import("message.zig");
-
-/// `MAX_SUBVERSION_LENGTH` in Bitcoin Core.
-pub const max_user_agent_len = 256;
+const PeerInfo = @import("peer.zig").PeerInfo;
+const max_user_agent_len = @import("peer.zig").max_user_agent_len;
 
 /// Byte offset of the user-agent var_str within a `version` payload:
 /// version(4) + services(8) + timestamp(8) + addr_recv(26) + addr_from(26) + nonce(8).
@@ -38,20 +37,6 @@ pub const Options = struct {
     magic: u32 = message.mainnet_magic,
     /// Whole-handshake deadline in nanoseconds.
     timeout_ns: u63 = 10 * std.time.ns_per_s,
-};
-
-/// What the peer advertised in its own `version`. Filled in by the handshake.
-pub const PeerInfo = struct {
-    protocol_version: i32,
-    services: u64,
-    timestamp: i64,
-    user_agent_len: u32,
-    user_agent_buffer: [max_user_agent_len]u8,
-
-    pub fn user_agent(peer: *const PeerInfo) []const u8 {
-        assert(peer.user_agent_len <= peer.user_agent_buffer.len);
-        return peer.user_agent_buffer[0..peer.user_agent_len];
-    }
 };
 
 /// Serialize our `version` payload into `buffer` and return the written prefix.

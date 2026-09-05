@@ -14,9 +14,9 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const net = std.Io.net;
 const io_uring = @import("io.zig");
-const DialError = @import("handshake.zig").DialError;
-const PeerInfo = @import("version.zig").PeerInfo;
-const max_user_agent_len = @import("version.zig").max_user_agent_len;
+const DialError = @import("peer.zig").DialError;
+const PeerInfo = @import("peer.zig").PeerInfo;
+const max_user_agent_len = @import("peer.zig").max_user_agent_len;
 const log = std.log.scoped(.p2p);
 
 /// The IPv4 text form is the widest address we print: `255.255.255.255:65535`.
