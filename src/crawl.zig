@@ -1,14 +1,15 @@
-//! Run many handshakes at once on one shared io_uring ring.
+//! Crawl the network from a frontier of addresses, on one shared io_uring ring.
 //!
-//! `connect_all` keeps up to `slots.len` `Peer`s in flight, stepping each
-//! one off `IO` callbacks and starting a fresh dial into the slot as soon as the
-//! last settles, until `target` succeed or the address list runs out. A slot
-//! stays alive until its outstanding completions drain, so nothing needs a
-//! synchronous ring scrub between handshakes. As each handshake settles,
-//! `connect_all` queues one `IORING_OP_WRITE` on the same ring appending that
-//! peer's one-line record to `peer_log`, and keeps ticking until every queued
-//! write has drained. Nothing is allocated: the caller owns the slot pool and
-//! the `PeerLog` line buffers.
+//! `connect_all` keeps up to `slots.len` `Peer` conversations in flight, pulling
+//! the next address from the `Frontier` as each slot frees and pushing every
+//! address a settled peer disclosed in its `addr` reply back onto the frontier,
+//! until `dial_max` dials have started or the frontier drains. A slot stays
+//! alive until its outstanding completions drain, so nothing needs a
+//! synchronous ring scrub between dials. As each dial settles, `connect_all`
+//! queues one `IORING_OP_WRITE` on the same ring appending that peer's one-line
+//! record to `peer_log`, and keeps ticking until every queued write has
+//! drained. Nothing is allocated: the caller owns the slot pool, the frontier
+//! buffers, and the `PeerLog` line buffers.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -22,73 +23,74 @@ const PeerLog = @import("peer_log.zig").PeerLog;
 const max_user_agent_len = @import("peer.zig").max_user_agent_len;
 const log = std.log.scoped(.p2p);
 
+pub const Frontier = @import("frontier.zig").Frontier;
+
 /// Tally returned by `connect_all`. The per-peer detail is in the `PeerLog`.
 pub const Summary = struct {
-    /// Addresses actually dialed (a handshake started, or the socket failed).
+    /// Addresses actually dialed (a conversation started, or the socket failed).
     dialed: u32,
     /// Of those, how many completed the version/verack exchange.
     succeeded: u32,
+    /// Addresses newly enqueued from peers' `addr` replies.
+    discovered: u32,
     /// Record lines that could not be written (a write CQE failed).
     dropped: u32,
 };
 
 /// Mutable dialing progress shared between `connect_all` and `fill_slot`.
 const Progress = struct {
-    /// Index of the next address to dial.
-    next: u32,
     dialed: u32,
     succeeded: u32,
 };
 
-/// Upper bound on CQEs one dialed address can produce: a full handshake's
+/// Upper bound on CQEs one dialed address can produce: a full conversation's
 /// completions plus its record write(s). `connect_all`'s loop bound is built
 /// from this so a stuck loop trips an assert rather than spinning forever.
 const cqes_per_dial_max = 128;
 
-/// Peer addresses from `addresses`, keeping up to `slots.len` in flight at
-/// once on the shared `io` ring, and stop starting new ones once `target` have
-/// succeeded. Queues exactly one `peer_log` record write per dialed peer, at the
-/// moment that peer's handshake settles, and drains those writes before
-/// returning. `slots` and the `peer_log` buffers are caller-owned; nothing is
-/// allocated.
+/// Dial addresses from `frontier`, keeping up to `slots.len` conversations in
+/// flight on the shared `io` ring, feeding each peer's disclosed addresses back
+/// onto `frontier`, and stopping once `dial_max` dials have started or the
+/// frontier is empty. Queues exactly one `peer_log` record per dialed peer as
+/// it settles and drains those writes before returning. `slots`, `frontier`,
+/// and the `peer_log` buffers are caller-owned; nothing is allocated.
 pub fn connect_all(
     io: *io_uring.IO,
     peer_log: *PeerLog,
-    addresses: []const net.IpAddress,
+    frontier: *Frontier,
     slots: []Peer,
-    target: u32,
+    dial_max: u32,
     options: version.Options,
 ) Summary {
-    assert(addresses.len >= 1);
-    assert(addresses.len <= std.math.maxInt(u32));
-    assert(addresses.len <= peer_log.lines.len);
     assert(slots.len >= 1);
-    assert(target >= 1);
+    assert(dial_max >= 1);
+    assert(dial_max <= peer_log.lines.len);
     assert(options.magic != 0);
     assert(options.user_agent.len > 0);
     assert(options.user_agent.len <= max_user_agent_len);
     assert(options.timeout_ns > 0);
 
     for (slots) |*slot| slot.status = .idle;
-    var progress: Progress = .{ .next = 0, .dialed = 0, .succeeded = 0 };
+    var progress: Progress = .{ .dialed = 0, .succeeded = 0 };
+    const enqueued_seeds = frontier.enqueued;
 
-    const iteration_max: u64 = cqes_per_dial_max * @as(u64, addresses.len) + 64;
+    const iteration_max: u64 = cqes_per_dial_max * @as(u64, dial_max) + 64;
     var iteration: u64 = 0;
     while (true) {
         iteration += 1;
         assert(iteration <= iteration_max); // event loop: the bound must hold
 
         for (slots) |*slot| {
-            if (slot.status == .settled) reap_slot(slot, peer_log, &progress);
+            if (slot.status == .settled) reap_slot(slot, peer_log, frontier, &progress);
             if (slot.status == .idle) {
-                fill_slot(io, peer_log, slot, addresses, &progress, target, options);
+                fill_slot(io, peer_log, slot, frontier, &progress, dial_max, options);
             }
         }
 
         if (all_idle(slots) and io.in_flight == 0) break;
 
         io.tick(1) catch |err| {
-            log.err("io_uring tick failed: {t}; abandoning {d} handshake(s)", .{
+            log.err("io_uring tick failed: {t}; abandoning {d} dial(s)", .{
                 err, busy_count(slots),
             });
             break;
@@ -98,53 +100,60 @@ pub fn connect_all(
     return .{
         .dialed = progress.dialed,
         .succeeded = progress.succeeded,
+        .discovered = frontier.enqueued - enqueued_seeds,
         .dropped = peer_log.dropped,
     };
 }
 
-/// A settled slot: write its record, fold it into the tally, and free it.
-fn reap_slot(slot: *Peer, peer_log: *PeerLog, progress: *Progress) void {
+/// A settled slot: write its record, push what it disclosed onto the frontier,
+/// fold it into the tally, and free it.
+fn reap_slot(slot: *Peer, peer_log: *PeerLog, frontier: *Frontier, progress: *Progress) void {
     assert(slot.status == .settled);
-    peer_log.emit(slot.address, slot.outcome, &slot.protocol.peer_info);
-    progress.dialed += 1;
+    const protocol = &slot.protocol;
+    peer_log.emit(slot.address, slot.outcome, &protocol.peer_info, protocol.discovered_len);
+
     if (slot.outcome) |_| {
         progress.succeeded += 1;
+        assert(protocol.discovered_len <= protocol.discovered.len);
+        for (protocol.discovered[0..protocol.discovered_len]) |disclosed| {
+            _ = frontier.push(disclosed);
+        }
     } else |_| {}
+
     slot.status = .idle;
 }
 
-/// Take addresses off the front of the queue until one handshake starts on
-/// `slot`, or there is nothing left to dial (`target` reached or list
-/// exhausted), leaving the slot `.idle`. A socket that will not open or start
-/// gets its one `peer_log` record here and counts as dialed.
+/// Pull addresses off the frontier until one conversation starts on `slot`, or
+/// the frontier is empty or the dial budget is spent, leaving the slot `.idle`.
+/// A socket that will not open or start gets its one `peer_log` record here and
+/// counts as dialed.
 fn fill_slot(
     io: *io_uring.IO,
     peer_log: *PeerLog,
     slot: *Peer,
-    addresses: []const net.IpAddress,
+    frontier: *Frontier,
     progress: *Progress,
-    target: u32,
+    dial_max: u32,
     options: version.Options,
 ) void {
     assert(slot.status == .idle);
-    const address_count: u32 = @intCast(addresses.len);
-    while (progress.succeeded < target and progress.next < address_count) {
-        const address = addresses[progress.next];
-        progress.next += 1;
+    while (progress.dialed < dial_max) {
+        const address = frontier.pop() orelse return;
 
         const fd = io_uring.open_socket(address) catch |err| {
             log.warn("open socket for {f}: {t}", .{ address, err });
-            peer_log.emit(address, error.SocketUnavailable, null);
+            peer_log.emit(address, error.SocketUnavailable, null, 0);
             progress.dialed += 1;
             continue;
         };
         slot.start(io, fd, address, options.timeout_ns, options) catch |err| {
-            log.warn("start handshake with {f}: {t}", .{ address, err });
+            log.warn("start dial with {f}: {t}", .{ address, err });
             io_uring.close_socket(fd); // no SQE armed yet: synchronous close
-            peer_log.emit(address, error.SocketUnavailable, null);
+            peer_log.emit(address, error.SocketUnavailable, null, 0);
             progress.dialed += 1;
             continue;
         };
+        progress.dialed += 1;
         return;
     }
 }

@@ -8,56 +8,73 @@ const crawl = @import("crawl.zig");
 const io_uring = @import("io.zig");
 const seeds = @import("seeds.zig");
 const PeerLog = @import("peer_log.zig").PeerLog;
+const Frontier = @import("frontier.zig").Frontier;
 const log = std.log.scoped(.main);
 
 /// One line per dialed peer is written here; truncated at the start of each run.
 const log_path = "btz.log";
 
-/// The handshake narrates each step on the `.p2p` scope at `debug`; the peer
-/// record now lives in `log_path`, so keep that scope quiet by default.
+/// The conversation narrates each step on the `.p2p` scope at `debug`; the peer
+/// record lives in `log_path`, so keep that scope quiet by default.
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{
         .{ .scope = .p2p, .level = .warn },
     },
 };
 
-/// Handshakes kept in flight on the ring at once.
+/// Conversations kept in flight on the ring at once.
 const concurrency = 8;
-/// Successful handshakes to reach before we stop dialing new addresses.
-const handshake_target = 4;
-/// Resolved peer addresses gathered from the seed list before dialing.
+/// Dials to start before the crawl stops (the frontier may still hold more).
+const dial_max = 128;
+/// Seed addresses resolved from DNS before the crawl starts.
 const seed_addresses_max = 32;
 /// Addresses a single DNS-seed lookup may contribute.
 const dns_addresses_max = 32;
-/// io_uring SQ depth. Each of `concurrency` handshakes holds only a few SQEs
-/// and each settling one queues a record write, so 256 is roomy; an undersized
-/// ring only makes `IO` park the overflow on its unqueued list, never fail.
+/// Frontier queue capacity: addresses discovered but not yet dialed.
+const frontier_capacity = 4096;
+/// Seen-set capacity (a power of two): every address ever enqueued. Sized well
+/// above `dial_max` plus the discoveries it can turn up so the set never fills.
+const seen_capacity = 1 << 16;
+/// io_uring SQ depth. Each conversation holds only a few SQEs and each settling
+/// one queues a record write, so 256 is roomy; an undersized ring only makes
+/// `IO` park the overflow on its unqueued list, never fail.
 const ring_entries = 256;
 
 comptime {
     assert(std.math.isPowerOfTwo(ring_entries));
+    assert(std.math.isPowerOfTwo(seen_capacity));
     assert(concurrency >= 1);
-    assert(handshake_target >= 1);
-    assert(handshake_target <= seed_addresses_max);
+    assert(dial_max >= 1);
+    assert(seed_addresses_max >= 1);
     assert(dns_addresses_max >= 1);
+    assert(frontier_capacity >= seed_addresses_max);
 }
+
+// Static storage: allocated at startup, never grown (TigerStyle).
+var slots: [concurrency]session.Peer = undefined;
+var log_lines: [dial_max]PeerLog.Line = undefined;
+var frontier_queue: [frontier_capacity]net.IpAddress = undefined;
+var seen_table: [seen_capacity]u32 = @splat(0);
 
 pub fn main(init: std.process.Init) !void {
     const port = seeds.mainnet_port;
 
     var address_buffer: [seed_addresses_max]net.IpAddress = undefined;
-    const addresses = collect_seed_addresses(
+    const seed_addresses = collect_seed_addresses(
         init.io,
         &address_buffer,
         &seeds.mainnet_dns_seeds,
         port,
     );
-    if (addresses.len == 0) {
+    if (seed_addresses.len == 0) {
         log.err("no seed addresses resolved", .{});
         return error.NoSeedAddresses;
     }
-    log.info("resolved {d} seed address(es); want {d} handshake(s), {d} in flight", .{
-        addresses.len, handshake_target, concurrency,
+
+    var frontier = Frontier.init(&frontier_queue, &seen_table);
+    for (seed_addresses) |seed_address| _ = frontier.push(seed_address);
+    log.info("seeded {d} address(es); dialing up to {d}, {d} in flight", .{
+        frontier.enqueued, dial_max, concurrency,
     });
 
     var io: io_uring.IO = try .init(ring_entries, 0);
@@ -71,29 +88,17 @@ pub fn main(init: std.process.Init) !void {
 
     // One record line per dialed address, written onto `io` as `IORING_OP_WRITE`s
     // so the crawl loop never blocks on the log file.
-    var log_lines: [seed_addresses_max]PeerLog.Line = undefined;
-    var peer_log = PeerLog.init(&io, log_file.handle, log_lines[0..addresses.len]);
+    var peer_log = PeerLog.init(&io, log_file.handle, &log_lines);
 
-    // Every handshake runs on this one ring, identified by a completion pointer
-    // stored in its SQE `user_data`; `connect_all` returns with the ring
+    // Every conversation runs on this one ring, identified by a completion
+    // pointer in its SQE `user_data`; `connect_all` returns with the ring
     // drained, having written one `btz.log` line per dialed peer as it settled.
-    var slots: [concurrency]session.Peer = undefined;
-    const summary = crawl.connect_all(
-        &io,
-        &peer_log,
-        addresses,
-        slots[0..],
-        handshake_target,
-        .{},
-    );
+    const summary = crawl.connect_all(&io, &peer_log, &frontier, &slots, dial_max, .{});
 
-    log.info("wrote {s}: {d} ok / {d} dialed, {d} record(s) dropped", .{
-        log_path, summary.succeeded, summary.dialed, summary.dropped,
+    log.info("wrote {s}: {d} ok / {d} dialed, {d} discovered, {d} record(s) dropped", .{
+        log_path, summary.succeeded, summary.dialed, summary.discovered, summary.dropped,
     });
     if (summary.succeeded == 0) return error.AllHandshakesFailed;
-    if (summary.succeeded < handshake_target) {
-        log.warn("only {d} of {d} target handshakes succeeded", .{ summary.succeeded, handshake_target });
-    }
 }
 
 /// Resolve seed hostnames into `buffer` (IPv4, `port`), stopping when it fills
@@ -148,6 +153,8 @@ test {
     _ = @import("message.zig");
     _ = @import("version.zig");
     _ = @import("peer.zig");
+    _ = @import("addr.zig");
+    _ = @import("frontier.zig");
     _ = @import("connection.zig");
     _ = @import("session.zig");
     _ = @import("peer_log.zig");

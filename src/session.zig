@@ -1,9 +1,10 @@
 //! The Bitcoin P2P peer conversation, as a `connection.Connection` protocol.
 //!
 //! `Protocol` is a pure state machine: fed peer bytes and send / deadline
-//! events by the connection, it returns `Directive`s. For now it runs the
-//! `version` / `verack` handshake and records the peer's `version` into
-//! `PeerInfo`; `getaddr` discovery lands on top of this. No I/O, no allocation.
+//! events by the connection, it returns `Directive`s. It runs the `version` /
+//! `verack` handshake, records the peer's `version` into `PeerInfo`, then sends
+//! `getaddr` and collects the IPv4 addresses from the peer's first `addr`
+//! reply. No I/O, no allocation.
 //!
 //! `Peer` is `Connection(Protocol)` — the type `crawl.zig` pools.
 
@@ -14,6 +15,7 @@ const net = std.Io.net;
 const connection = @import("connection.zig");
 const message = @import("message.zig");
 const version = @import("version.zig");
+const addr = @import("addr.zig");
 const peer_types = @import("peer.zig");
 const Directive = connection.Directive;
 const PeerInfo = peer_types.PeerInfo;
@@ -25,9 +27,14 @@ const log = std.log.scoped(.p2p);
 /// `Protocol.Options` is `version.Options`.
 pub const Peer = connection.Connection(Protocol);
 
-/// Receive buffer. Must hold the largest single message we parse whole (a
-/// `version`) plus its header; other messages are consumed and dropped.
-const recv_buffer_len = 4 * 1024;
+/// Addresses kept from one peer's `getaddr` reply. An `addr` may carry up to
+/// `addr.entries_max`; a few hundred per peer keeps the crawl frontier fed
+/// without an outsized slot.
+pub const discovered_max = 256;
+
+/// Receive buffer. Must hold the largest single message we parse whole — a
+/// full `addr` — plus its header; other messages are consumed and dropped.
+const recv_buffer_len = header_len + addr.addr_payload_max;
 
 /// Send buffer: one framed message at a time; our `version` is the largest.
 const frame_buffer_len = header_len + version.version_payload_max;
@@ -38,7 +45,9 @@ const pump_turns_max = recv_buffer_len / header_len + 4;
 
 comptime {
     assert(recv_buffer_len >= header_len + version.version_payload_max);
+    assert(recv_buffer_len <= message.message_payload_max);
     assert(frame_buffer_len >= header_len + version.version_payload_max);
+    assert(discovered_max >= 1);
 }
 
 pub const Protocol = struct {
@@ -49,6 +58,8 @@ pub const Protocol = struct {
     address: net.IpAddress,
 
     peer_info: PeerInfo,
+    discovered: [discovered_max]net.IpAddress,
+    discovered_len: u32,
 
     send_buffer: [frame_buffer_len]u8,
     recv_bytes: [recv_buffer_len]u8,
@@ -57,6 +68,8 @@ pub const Protocol = struct {
     version_received: bool,
     verack_sent: bool,
     verack_received: bool,
+    getaddr_sent: bool,
+    addr_received: bool,
 
     pub fn reset(protocol: *Protocol, address: net.IpAddress, options: Options) void {
         assert(options.magic != 0);
@@ -66,12 +79,16 @@ pub const Protocol = struct {
             .options = options,
             .address = address,
             .peer_info = undefined,
+            .discovered = undefined,
+            .discovered_len = 0,
             .send_buffer = undefined,
             .recv_bytes = undefined,
             .recv_len = 0,
             .version_received = false,
             .verack_sent = false,
             .verack_received = false,
+            .getaddr_sent = false,
+            .addr_received = false,
         };
     }
 
@@ -112,11 +129,13 @@ pub const Protocol = struct {
     }
 
     pub fn on_deadline(protocol: *Protocol) Directive {
-        _ = protocol;
+        // Past verack the record is already usable: a slow or silent `getaddr`
+        // is not a failure, just zero discovered addresses.
+        if (protocol.verack_received) return .done;
         return .{ .fail = error.Timeout };
     }
 
-    /// Consume whole buffered messages, advancing the handshake. Returns the
+    /// Consume whole buffered messages, advancing the conversation. Returns the
     /// next directive: send our reply, read more, done, or fail.
     fn pump(protocol: *Protocol) Directive {
         var turn: u32 = 0;
@@ -131,8 +150,11 @@ pub const Protocol = struct {
                 const frame = message.frame_in_place(&protocol.send_buffer, protocol.options.magic, "verack", 0);
                 return .{ .send = frame };
             }
-            if (protocol.version_received and protocol.verack_sent and protocol.verack_received) {
-                return .done;
+            if (protocol.handshake_done() and !protocol.getaddr_sent) {
+                protocol.getaddr_sent = true;
+                log.debug("-> getaddr", .{});
+                const frame = message.frame_in_place(&protocol.send_buffer, protocol.options.magic, "getaddr", 0);
+                return .{ .send = frame };
             }
 
             if (protocol.recv_len < header_len) return .recv;
@@ -151,7 +173,16 @@ pub const Protocol = struct {
                 protocol.recv_bytes[header_len..total],
             ) catch |err| return .{ .fail = err };
             protocol.consume(total);
+
+            if (protocol.addr_received) {
+                log.debug("<- addr ({d} address(es))", .{protocol.discovered_len});
+                return .done;
+            }
         }
+    }
+
+    fn handshake_done(protocol: *const Protocol) bool {
+        return protocol.version_received and protocol.verack_sent and protocol.verack_received;
     }
 
     fn handle_message(
@@ -177,6 +208,9 @@ pub const Protocol = struct {
         } else if (message.command_eql(command, "verack")) {
             protocol.verack_received = true;
             log.debug("<- verack", .{});
+        } else if (protocol.getaddr_sent and message.command_eql(command, "addr")) {
+            protocol.discovered_len = addr.parse_addr(payload, &protocol.discovered);
+            protocol.addr_received = true;
         } else {
             log.debug("<- {s} ({d} bytes, ignored)", .{
                 message.command_name(command), payload.len,

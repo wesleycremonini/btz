@@ -1,11 +1,11 @@
 //! One-line-per-peer record file, written straight onto the shared io_uring so
 //! the crawl loop never blocks on it.
 //!
-//! `connect_all` hands `PeerLog` one dialed peer at a time as its handshake
-//! settles; `emit` renders the record into a caller-owned line buffer and queues
-//! its `IORING_OP_WRITE`. Each queued line keeps its own buffer and completion
+//! `connect_all` hands `PeerLog` one dialed peer at a time as its dial settles;
+//! `emit` renders the record into a caller-owned line buffer and queues its
+//! `IORING_OP_WRITE`. Each queued line keeps its own buffer and completion
 //! reserved until its write CQE drains. Nothing is allocated: `lines` is backed
-//! by a caller array sized to the address count, so a free slot is always
+//! by a caller array sized to the dial budget, so a free slot is always
 //! available and no line is ever recycled.
 
 const std = @import("std");
@@ -23,10 +23,12 @@ const log = std.log.scoped(.p2p);
 const ip_text_max = "255.255.255.255:65535".len;
 
 /// Bytes one record line can occupy. The `ok` form is the widest: address, the
-/// literal fields, and a user agent in which every byte escaped to `\xNN`.
+/// literal fields, a user agent in which every byte escaped to `\xNN`, and the
+/// trailing discovered-address count.
 const line_bytes_max =
     ip_text_max + "\tok\t".len + "-2147483648".len + "\t0x".len +
-    "ffffffffffffffff".len + "\t".len + 4 * max_user_agent_len + "\n".len;
+    "ffffffffffffffff".len + "\t".len + 4 * max_user_agent_len +
+    "\t".len + "4294967295".len + "\n".len;
 
 comptime {
     // The `fail` form must fit too: address, tag, the longest error name, `\n`.
@@ -72,19 +74,21 @@ pub const PeerLog = struct {
     }
 
     /// Render the record for `address` into a fresh line and queue its write.
-    /// `peer` is required for (and only read on) a successful `outcome`.
+    /// `peer` and `discovered` are required for (and only read on) a successful
+    /// `outcome`.
     pub fn emit(
         peer_log: *PeerLog,
         address: net.IpAddress,
         outcome: DialError!void,
         peer: ?*const PeerInfo,
+        discovered: u32,
     ) void {
         assert(peer_log.used < peer_log.lines.len);
         const line = &peer_log.lines[peer_log.used];
         peer_log.used += 1;
 
         var writer = std.Io.Writer.fixed(&line.buffer);
-        format_peer_line(&writer, address, outcome, peer) catch |err| {
+        format_peer_line(&writer, address, outcome, peer, discovered) catch |err| {
             // `buffer` is sized for the widest line; a failure here is a bug.
             log.err("render record for {f}: {t}", .{ address, err });
             peer_log.dropped += 1;
@@ -155,20 +159,22 @@ fn on_write_completion(context: ?*anyopaque, completion: *io_uring.Completion, r
     peer_log.on_write_complete(completion, result);
 }
 
-/// Render one record line to `writer`: `<addr>\tok\t<version>\t0x<services>\t<ua>`
-/// or `<addr>\tfail\t<error>`, newline-terminated.
+/// Render one record line to `writer`, newline-terminated:
+/// `<addr>\tok\t<version>\t0x<services>\t<ua>\t<discovered>` on success, or
+/// `<addr>\tfail\t<error>` otherwise.
 fn format_peer_line(
     writer: *std.Io.Writer,
     address: net.IpAddress,
     outcome: DialError!void,
     peer: ?*const PeerInfo,
+    discovered: u32,
 ) std.Io.Writer.Error!void {
     if (outcome) |_| {
         assert(peer != null);
         const info = peer.?;
         try writer.print("{f}\tok\t{d}\t0x{x}\t", .{ address, info.protocol_version, info.services });
         try write_escaped(writer, info.user_agent());
-        try writer.writeByte('\n');
+        try writer.print("\t{d}\n", .{discovered});
     } else |err| {
         try writer.print("{f}\tfail\t{s}\n", .{ address, @errorName(err) });
     }
@@ -207,9 +213,9 @@ test "format_peer_line: ok record is one escaped tab-separated line" {
     var buffer: [line_bytes_max]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     const address: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 1, 2, 3, 4 }, .port = 8333 } };
-    try format_peer_line(&writer, address, {}, &peer);
+    try format_peer_line(&writer, address, {}, &peer, 42);
     try std.testing.expectEqualStrings(
-        "1.2.3.4:8333\tok\t70016\t0x409\t/Satoshi:27.0.0/\\x09/evil/\n",
+        "1.2.3.4:8333\tok\t70016\t0x409\t/Satoshi:27.0.0/\\x09/evil/\t42\n",
         writer.buffered(),
     );
 }
@@ -218,6 +224,6 @@ test "format_peer_line: failed dial records the error name" {
     var buffer: [line_bytes_max]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     const address: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 1 }, .port = 8333 } };
-    try format_peer_line(&writer, address, error.ConnectionRefused, null);
+    try format_peer_line(&writer, address, error.ConnectionRefused, null, 0);
     try std.testing.expectEqualStrings("10.0.0.1:8333\tfail\tConnectionRefused\n", writer.buffered());
 }
