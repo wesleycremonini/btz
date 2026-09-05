@@ -54,7 +54,9 @@ comptime {
 
 // Static storage: allocated at startup, never grown (TigerStyle).
 var slots: [concurrency]session.Peer = undefined;
-var log_lines: [dial_max]PeerLog.Line = undefined;
+// Recycled, so sized to the peak of in-flight record writes -- a few per
+// concurrent conversation -- not to `dial_max`.
+var log_lines: [4 * concurrency]PeerLog.Line = undefined;
 var frontier_queue: [frontier_capacity]net.IpAddress = undefined;
 var seen_table: [seen_capacity]u32 = @splat(0);
 

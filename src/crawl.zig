@@ -64,7 +64,9 @@ pub fn connect_all(
 ) Summary {
     assert(slots.len >= 1);
     assert(dial_max >= 1);
-    assert(dial_max <= peer_log.lines.len);
+    // The line pool is recycled, so it need only cover the writes in flight at
+    // once — one per settling slot, plus headroom for those still draining.
+    assert(peer_log.lines.len >= slots.len);
     assert(options.magic != 0);
     assert(options.user_agent.len > 0);
     assert(options.user_agent.len <= max_user_agent_len);

@@ -2,11 +2,11 @@
 //! the crawl loop never blocks on it.
 //!
 //! `connect_all` hands `PeerLog` one dialed peer at a time as its dial settles;
-//! `emit` renders the record into a caller-owned line buffer and queues its
-//! `IORING_OP_WRITE`. Each queued line keeps its own buffer and completion
-//! reserved until its write CQE drains. Nothing is allocated: `lines` is backed
-//! by a caller array sized to the dial budget, so a free slot is always
-//! available and no line is ever recycled.
+//! `emit` renders the record into a free line buffer and queues its
+//! `IORING_OP_WRITE`. A line stays reserved from `emit` until its write CQE
+//! drains, then returns to a free list for the next record — so the caller
+//! sizes `lines` to the peak in-flight write count (a few per concurrent dial),
+//! not to the whole dial budget. Nothing is allocated.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -35,6 +35,9 @@ comptime {
     assert(line_bytes_max >= ip_text_max + "\tfail\t".len + "ConnectionResetByPeer".len + 1);
 }
 
+/// Sentinel for "no line": the end of the free list, and an exhausted pool.
+const no_line = std.math.maxInt(u32);
+
 /// One framed record file. Caller-owned, no allocation: see the module comment.
 pub const PeerLog = struct {
     io: *io_uring.IO,
@@ -43,17 +46,20 @@ pub const PeerLog = struct {
     /// Absolute file offset the next queued line writes at. Advanced at submit
     /// time, so lines land in settle order though writes complete out of order.
     offset: u64,
-    /// Lines handed out of `lines` so far.
-    used: u32,
+    /// Head of the free-line list (`Line.next_free` links it), or `no_line`.
+    free_head: u32,
     /// Writes queued on the ring and not yet reaped.
     in_flight: u32,
-    /// Lines a failed write CQE lost.
+    /// Records lost: a render or write failure, or the line pool was exhausted.
     dropped: u32,
 
     /// One framed record line: its rendered bytes and the completion for its
-    /// write. `written` tracks progress so a short write re-arms only the tail.
+    /// write. `written` tracks progress so a short write re-arms only the tail;
+    /// `next_free` links it on `PeerLog.free_head` while idle.
     pub const Line = struct {
         completion: io_uring.Completion,
+        index: u32,
+        next_free: u32,
         offset: u64,
         len: u32,
         written: u32,
@@ -62,20 +68,25 @@ pub const PeerLog = struct {
 
     pub fn init(io: *io_uring.IO, fd: linux.fd_t, lines: []Line) PeerLog {
         assert(lines.len >= 1);
+        assert(lines.len < no_line);
+        for (lines, 0..) |*line, index| {
+            line.index = @intCast(index);
+            line.next_free = if (index + 1 < lines.len) @intCast(index + 1) else no_line;
+        }
         return .{
             .io = io,
             .fd = fd,
             .lines = lines,
             .offset = 0,
-            .used = 0,
+            .free_head = 0,
             .in_flight = 0,
             .dropped = 0,
         };
     }
 
-    /// Render the record for `address` into a fresh line and queue its write.
+    /// Render the record for `address` into a free line and queue its write.
     /// `peer` and `discovered` are required for (and only read on) a successful
-    /// `outcome`.
+    /// `outcome`. A record is dropped if the line pool is momentarily empty.
     pub fn emit(
         peer_log: *PeerLog,
         address: net.IpAddress,
@@ -83,15 +94,22 @@ pub const PeerLog = struct {
         peer: ?*const PeerInfo,
         discovered: u32,
     ) void {
-        assert(peer_log.used < peer_log.lines.len);
-        const line = &peer_log.lines[peer_log.used];
-        peer_log.used += 1;
+        if (peer_log.free_head == no_line) {
+            log.warn("record for {f} dropped: line pool exhausted", .{address});
+            peer_log.dropped += 1;
+            return;
+        }
+        const line = &peer_log.lines[peer_log.free_head];
+        assert(line.index == peer_log.free_head);
+        peer_log.free_head = line.next_free;
+        line.next_free = no_line;
 
         var writer = std.Io.Writer.fixed(&line.buffer);
         format_peer_line(&writer, address, outcome, peer, discovered) catch |err| {
             // `buffer` is sized for the widest line; a failure here is a bug.
             log.err("render record for {f}: {t}", .{ address, err });
             peer_log.dropped += 1;
+            peer_log.release(line);
             return;
         };
 
@@ -115,14 +133,15 @@ pub const PeerLog = struct {
         peer_log.in_flight += 1;
     }
 
-    /// One write CQE landed: advance the line, re-arming its tail on a short
-    /// write and counting a failed write as a dropped line.
+    /// One write CQE landed: return a fully-written line to the pool, re-arm the
+    /// tail on a short write, or count a failed write as a dropped line.
     pub fn on_write_complete(peer_log: *PeerLog, completion: *io_uring.Completion, result: i32) void {
         assert(peer_log.in_flight > 0);
         peer_log.in_flight -= 1;
 
         const line: *Line = @fieldParentPtr("completion", completion);
         assert(line.written < line.len);
+        assert(line.next_free == no_line);
 
         if (result <= 0) {
             if (result < 0) {
@@ -133,13 +152,17 @@ pub const PeerLog = struct {
                 log.err("record write at offset {d} returned 0", .{line.offset});
             }
             peer_log.dropped += 1;
+            peer_log.release(line);
             return;
         }
 
         const wrote: u32 = @intCast(result);
         assert(wrote <= line.len - line.written);
         line.written += wrote;
-        if (line.written == line.len) return;
+        if (line.written == line.len) {
+            peer_log.release(line);
+            return;
+        }
 
         peer_log.io.write(
             &line.completion,
@@ -150,6 +173,14 @@ pub const PeerLog = struct {
             on_write_completion,
         );
         peer_log.in_flight += 1;
+    }
+
+    /// Return `line` to the head of the free list.
+    fn release(peer_log: *PeerLog, line: *Line) void {
+        assert(line.next_free == no_line);
+        assert(line.index < peer_log.lines.len);
+        line.next_free = peer_log.free_head;
+        peer_log.free_head = line.index;
     }
 };
 
