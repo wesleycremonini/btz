@@ -1,6 +1,6 @@
 //! Run many handshakes at once on one shared io_uring ring.
 //!
-//! `connect_all` keeps up to `slots.len` `Handshake`s in flight, stepping each
+//! `connect_all` keeps up to `slots.len` `Peer`s in flight, stepping each
 //! one off `IO` callbacks and starting a fresh dial into the slot as soon as the
 //! last settles, until `target` succeed or the address list runs out. A slot
 //! stays alive until its outstanding completions drain, so nothing needs a
@@ -15,9 +15,9 @@ const assert = std.debug.assert;
 
 const net = std.Io.net;
 const io_uring = @import("io.zig");
-const handshake = @import("handshake.zig");
+const session = @import("session.zig");
 const version = @import("version.zig");
-const Handshake = handshake.Handshake;
+const Peer = session.Peer;
 const PeerLog = @import("peer_log.zig").PeerLog;
 const max_user_agent_len = @import("peer.zig").max_user_agent_len;
 const log = std.log.scoped(.p2p);
@@ -45,7 +45,7 @@ const Progress = struct {
 /// from this so a stuck loop trips an assert rather than spinning forever.
 const cqes_per_dial_max = 128;
 
-/// Handshake addresses from `addresses`, keeping up to `slots.len` in flight at
+/// Peer addresses from `addresses`, keeping up to `slots.len` in flight at
 /// once on the shared `io` ring, and stop starting new ones once `target` have
 /// succeeded. Queues exactly one `peer_log` record write per dialed peer, at the
 /// moment that peer's handshake settles, and drains those writes before
@@ -55,7 +55,7 @@ pub fn connect_all(
     io: *io_uring.IO,
     peer_log: *PeerLog,
     addresses: []const net.IpAddress,
-    slots: []Handshake,
+    slots: []Peer,
     target: u32,
     options: version.Options,
 ) Summary {
@@ -103,9 +103,9 @@ pub fn connect_all(
 }
 
 /// A settled slot: write its record, fold it into the tally, and free it.
-fn reap_slot(slot: *Handshake, peer_log: *PeerLog, progress: *Progress) void {
+fn reap_slot(slot: *Peer, peer_log: *PeerLog, progress: *Progress) void {
     assert(slot.status == .settled);
-    peer_log.emit(slot.address, slot.outcome, &slot.peer);
+    peer_log.emit(slot.address, slot.outcome, &slot.protocol.peer_info);
     progress.dialed += 1;
     if (slot.outcome) |_| {
         progress.succeeded += 1;
@@ -120,7 +120,7 @@ fn reap_slot(slot: *Handshake, peer_log: *PeerLog, progress: *Progress) void {
 fn fill_slot(
     io: *io_uring.IO,
     peer_log: *PeerLog,
-    slot: *Handshake,
+    slot: *Peer,
     addresses: []const net.IpAddress,
     progress: *Progress,
     target: u32,
@@ -138,7 +138,7 @@ fn fill_slot(
             progress.dialed += 1;
             continue;
         };
-        slot.start(io, fd, address, options) catch |err| {
+        slot.start(io, fd, address, options.timeout_ns, options) catch |err| {
             log.warn("start handshake with {f}: {t}", .{ address, err });
             io_uring.close_socket(fd); // no SQE armed yet: synchronous close
             peer_log.emit(address, error.SocketUnavailable, null);
@@ -149,14 +149,14 @@ fn fill_slot(
     }
 }
 
-fn all_idle(slots: []const Handshake) bool {
+fn all_idle(slots: []const Peer) bool {
     for (slots) |*slot| {
         if (slot.status != .idle) return false;
     }
     return true;
 }
 
-fn busy_count(slots: []const Handshake) u32 {
+fn busy_count(slots: []const Peer) u32 {
     var count: u32 = 0;
     for (slots) |*slot| {
         switch (slot.status) {

@@ -3,7 +3,7 @@ const assert = std.debug.assert;
 const Io = std.Io;
 const net = std.Io.net;
 
-const handshake = @import("handshake.zig");
+const session = @import("session.zig");
 const crawl = @import("crawl.zig");
 const io_uring = @import("io.zig");
 const seeds = @import("seeds.zig");
@@ -77,7 +77,7 @@ pub fn main(init: std.process.Init) !void {
     // Every handshake runs on this one ring, identified by a completion pointer
     // stored in its SQE `user_data`; `connect_all` returns with the ring
     // drained, having written one `btz.log` line per dialed peer as it settled.
-    var slots: [concurrency]handshake.Handshake = undefined;
+    var slots: [concurrency]session.Peer = undefined;
     const summary = crawl.connect_all(
         &io,
         &peer_log,
@@ -148,7 +148,8 @@ test {
     _ = @import("message.zig");
     _ = @import("version.zig");
     _ = @import("peer.zig");
-    _ = @import("handshake.zig");
+    _ = @import("connection.zig");
+    _ = @import("session.zig");
     _ = @import("peer_log.zig");
     _ = @import("crawl.zig");
     _ = @import("io.zig");
