@@ -1,11 +1,13 @@
 //! One Bitcoin P2P version/verack handshake, driven by the io_uring event loop.
 //!
-//! A `Handshake` is a single slot whose state machine steps off `IO`
-//! completions — connect -> send our `version` -> receive the peer's `version`
-//! (reply `verack`) and `verack` -> done. Every SQE it queues carries a pointer
-//! to one of the slot's `Completion`s as its `user_data`, so a CQE names both
-//! the handshake and which op finished; a slot stays alive until its outstanding
-//! completions drain. Nothing is allocated: the caller owns the slot.
+//! A `Handshake` is a single slot whose state machine steps off `IO` callbacks:
+//! connect -> send our `version` -> receive the peer's `version` (reply
+//! `verack`) and `verack` -> done. It owns four `io_uring.Completion`s — the
+//! live I/O op, the deadline timer, the cancel/remove that retires whichever of
+//! those outlives the handshake, and the socket close — and every callback
+//! carries the slot as its `context`. A slot stays alive until its outstanding
+//! completions drain, so a cancelled timer keeps the slot pinned until its CQE
+//! lands. Nothing is allocated: the caller owns the slot.
 //!
 //! `connect_all` in `crawl.zig` runs many of these at once on one shared ring.
 //! Message framing lives in `message.zig`; the `version` payload in `version.zig`.
@@ -35,17 +37,17 @@ const frame_buffer_len = header_len + version.version_payload_max;
 /// fit comfortably. Only a pathological peer reaches this before the deadline.
 const completions_max = 64;
 
-/// Per-handshake SQE identities. Each is a distinct `user_data` (a pointer into
-/// `Handshake.completions`) so a CQE names both the handshake and which of its
-/// SQEs completed: the in-flight I/O op, the deadline timer, the cancel/remove
-/// op that retires whichever of those outlives the handshake, and the socket
-/// close that runs once the outcome is final.
+/// Indices into `Handshake.completions`. Each is a distinct `io_uring.Completion`
+/// (a distinct `user_data`) so a CQE names which of the slot's SQEs finished:
+/// the in-flight I/O op, the deadline timer, the cancel/remove that retires
+/// whichever of those outlives the handshake, and the closing socket close.
 const completion_io = 0;
 const completion_timeout = 1;
 const completion_cancel = 2;
 const completion_close = 3;
 
-/// Per-slot `Completion` count. `crawl.min_ring_entries` budgets SQEs against it.
+/// Per-slot `io_uring.Completion` count. `crawl.min_ring_entries` budgets SQEs
+/// against it.
 pub const completion_count = 4;
 
 comptime {
@@ -84,17 +86,6 @@ pub const DialError = error{
     Unexpected,
 };
 
-/// Per-SQE identity carried in `user_data`. A pointer to one of these names both
-/// the issuer of the SQE and which of its ops finished. `slot` is the issuing
-/// handshake; it is `null` for a `PeerLog` record write, which `connect_all`
-/// routes by `kind` alone and never dereferences.
-pub const Completion = struct {
-    slot: ?*Handshake,
-    kind: Kind,
-
-    pub const Kind = enum { io, timeout, cancel, close, log_write };
-};
-
 pub const Handshake = struct {
     io: *io_uring.IO,
     fd: linux.fd_t,
@@ -104,10 +95,9 @@ pub const Handshake = struct {
     outcome: DialError!void,
     peer: PeerInfo,
 
-    /// One stable `user_data` identity per SQE kind, each pointing back here so
-    /// a CQE names both the handshake and which SQE completed. The slot must not
-    /// move while any completion is outstanding.
-    completions: [completion_count]Completion,
+    /// One stable `io_uring.Completion` per SQE kind (see the `completion_*`
+    /// indices). The slot must not move while any of them is outstanding.
+    completions: [completion_count]io_uring.Completion,
     /// SQEs submitted for this slot and not yet reaped. The slot is done only
     /// once this reaches zero, so a cancelled deadline timer keeps the slot
     /// alive until its `-ECANCELED` CQE is drained.
@@ -118,8 +108,9 @@ pub const Handshake = struct {
     status: Status,
     phase: Phase,
 
-    /// Stable storage the connect / timeout SQEs point at.
+    /// Stable storage the connect SQE points at.
     sockaddr: io_uring.SockAddr,
+    /// Relative whole-handshake deadline; copied into the timeout SQE at `arm`.
     deadline: linux.kernel_timespec,
 
     send_buffer: [frame_buffer_len]u8,
@@ -133,13 +124,15 @@ pub const Handshake = struct {
     verack_received: bool,
 
     /// Slot lifecycle, distinct from `Phase`:
-    /// - `idle`    unused, ready for `fill_slot`
+    /// - `idle`    unused, ready for `start`
     /// - `dialing` handshake running, outcome not yet known
     /// - `winding` outcome decided; still draining the cancelled SQE(s)
     /// - `closing` outcome final; the socket close is in flight on the ring
     /// - `settled` `in_flight == 0`, `outcome` / `peer` final, ready to recycle
     pub const Status = enum { idle, dialing, winding, closing, settled };
     const Phase = enum { connecting, sending, receiving, complete };
+    /// Which of the slot's completions a callback is reporting.
+    const Kind = enum { io, timeout, cancel, close };
     const PumpResult = enum { awaiting_more, send_verack, complete };
     const ArmOp = enum { timeout, connect, send, recv };
 
@@ -152,6 +145,7 @@ pub const Handshake = struct {
     ) io_uring.SockAddr.FromError!void {
         assert(slot.status == .idle);
         assert(options.magic != 0);
+        assert(options.timeout_ns > 0);
 
         const sockaddr = try io_uring.SockAddr.from(address);
         slot.* = .{
@@ -161,12 +155,7 @@ pub const Handshake = struct {
             .address = address,
             .outcome = {},
             .peer = undefined,
-            .completions = .{
-                .{ .slot = slot, .kind = .io },
-                .{ .slot = slot, .kind = .timeout },
-                .{ .slot = slot, .kind = .cancel },
-                .{ .slot = slot, .kind = .close },
-            },
+            .completions = undefined,
             .in_flight = 0,
             .seen = 0,
             .status = .dialing,
@@ -186,31 +175,48 @@ pub const Handshake = struct {
 
         slot.arm(.timeout);
         slot.arm(.connect);
+        assert(slot.in_flight == 2);
         log.debug("connecting to {f}", .{address});
     }
 
     /// Queue one SQE and count it against `in_flight`. The shared ring is sized
-    /// (`min_ring_entries`) so the SQ can never be full here.
+    /// (`min_ring_entries`) so the SQ is not normally full; `IO` parks the
+    /// completion and retries it next tick if it is.
     fn arm(slot: *Handshake, comptime op: ArmOp) void {
         switch (op) {
-            .timeout => slot.io.prep_timeout(slot.tag(completion_timeout), &slot.deadline) catch unreachable,
-            .connect => slot.io.prep_connect(slot.tag(completion_io), slot.fd, &slot.sockaddr) catch unreachable,
-            .send => slot.io.prep_send(slot.tag(completion_io), slot.fd, slot.send_frame) catch unreachable,
-            .recv => slot.io.prep_recv(
-                slot.tag(completion_io),
+            .timeout => slot.io.timeout(
+                &slot.completions[completion_timeout],
+                slot.deadline,
+                slot,
+                on_timeout_completion,
+            ),
+            .connect => slot.io.connect(
+                &slot.completions[completion_io],
+                slot.fd,
+                slot.sockaddr,
+                slot,
+                on_io_completion,
+            ),
+            .send => slot.io.send(
+                &slot.completions[completion_io],
+                slot.fd,
+                slot.send_frame,
+                slot,
+                on_io_completion,
+            ),
+            .recv => slot.io.recv(
+                &slot.completions[completion_io],
                 slot.fd,
                 slot.recv_buffer[slot.recv_len..],
-            ) catch unreachable,
+                slot,
+                on_io_completion,
+            ),
         }
         slot.in_flight += 1;
+        assert(slot.in_flight <= 2);
     }
 
-    fn tag(slot: *Handshake, comptime index: usize) u64 {
-        comptime assert(index < completion_count);
-        return @intCast(@intFromPtr(&slot.completions[index]));
-    }
-
-    pub fn on_completion(slot: *Handshake, kind: Completion.Kind, cqe: linux.io_uring_cqe) void {
+    fn on_completion(slot: *Handshake, kind: Kind, result: i32) void {
         assert(slot.in_flight > 0);
         slot.in_flight -= 1;
         slot.seen += 1;
@@ -221,7 +227,12 @@ pub const Handshake = struct {
                 // Outcome already decided; drain the cancelled SQE(s), then
                 // hand the socket close to the ring and wait on its CQE too.
                 if (slot.in_flight == 0) {
-                    slot.io.prep_close(slot.tag(completion_close), slot.fd) catch unreachable;
+                    slot.io.close(
+                        &slot.completions[completion_close],
+                        slot.fd,
+                        slot,
+                        on_close_completion,
+                    );
                     slot.in_flight = 1;
                     slot.status = .closing;
                 }
@@ -231,60 +242,71 @@ pub const Handshake = struct {
                 assert(slot.in_flight == 0);
                 slot.status = .settled;
             },
-            .dialing => slot.step(kind, cqe),
+            .dialing => slot.step(kind, result),
         }
     }
 
     /// Advance a running handshake by one completion.
-    fn step(slot: *Handshake, kind: Completion.Kind, cqe: linux.io_uring_cqe) void {
+    fn step(slot: *Handshake, kind: Kind, result: i32) void {
         assert(slot.status == .dialing);
 
         if (slot.seen > completions_max) return slot.finish(error.TooManyCompletions, kind);
         switch (kind) {
             .cancel => unreachable, // only issued once status is .winding
             .close => unreachable, // only issued once status is .closing
-            .log_write => unreachable, // owned by PeerLog, never a handshake
             .timeout => return slot.finish(error.Timeout, kind),
             .io => {},
         }
 
-        slot.on_io(cqe) catch |err| return slot.finish(err, kind);
+        slot.on_io(result) catch |err| return slot.finish(err, kind);
         if (slot.phase == .complete) {
-            assert(slot.version_received and slot.verack_received);
+            assert(slot.version_received);
+            assert(slot.verack_received);
             slot.finish({}, kind);
         }
     }
 
-    /// Record the outcome, cancel whichever SQE this handshake still has armed
+    /// Record the outcome, retire whichever SQE this handshake still has armed
     /// (the timer, unless we are finishing *because* the timer fired), and move
-    /// to `.winding` until that cancellation's CQEs drain. No synchronous reap:
+    /// to `.winding` until that retirement's CQEs drain. No synchronous reap:
     /// the event loop picks those CQEs up while other handshakes run.
-    fn finish(slot: *Handshake, outcome: DialError!void, trigger: Completion.Kind) void {
+    fn finish(slot: *Handshake, outcome: DialError!void, trigger: Kind) void {
         assert(slot.status == .dialing);
+        assert(trigger == .io or trigger == .timeout);
         slot.outcome = outcome;
 
         // Whichever SQE we did not just reap is still armed.
         if (trigger == .timeout) {
-            slot.io.prep_cancel(slot.tag(completion_cancel), slot.tag(completion_io)) catch unreachable;
+            slot.io.cancel(
+                &slot.completions[completion_cancel],
+                &slot.completions[completion_io],
+                slot,
+                on_cancel_completion,
+            );
         } else {
-            slot.io.prep_timeout_remove(slot.tag(completion_cancel), slot.tag(completion_timeout)) catch unreachable;
+            slot.io.timeout_remove(
+                &slot.completions[completion_cancel],
+                &slot.completions[completion_timeout],
+                slot,
+                on_cancel_completion,
+            );
         }
         slot.in_flight += 1; // the cancel / remove op's own CQE
         slot.status = .winding;
         assert(slot.in_flight >= 2); // that CQE, plus the still-armed target's
     }
 
-    fn on_io(slot: *Handshake, cqe: linux.io_uring_cqe) DialError!void {
+    fn on_io(slot: *Handshake, result: i32) DialError!void {
         switch (slot.phase) {
             .connecting => {
-                try check_completion(cqe);
-                assert(cqe.res == 0);
+                try check_result(result);
+                assert(result == 0);
                 log.debug("tcp connected", .{});
                 try slot.send_version();
             },
             .sending => {
-                try check_completion(cqe);
-                const sent: u32 = @intCast(cqe.res);
+                try check_result(result);
+                const sent: u32 = @intCast(result);
                 assert(sent <= slot.send_frame.len);
                 slot.send_frame = slot.send_frame[sent..];
                 if (slot.send_frame.len > 0) {
@@ -294,8 +316,8 @@ pub const Handshake = struct {
                 try slot.advance();
             },
             .receiving => {
-                try check_completion(cqe);
-                const received: u32 = @intCast(cqe.res);
+                try check_result(result);
+                const received: u32 = @intCast(result);
                 if (received == 0) return error.EndOfStream;
                 slot.recv_len += received;
                 assert(slot.recv_len <= recv_buffer_len);
@@ -398,10 +420,41 @@ pub const Handshake = struct {
     }
 };
 
-/// Map a failed CQE (`res` < 0) to an error.
-fn check_completion(cqe: linux.io_uring_cqe) DialError!void {
-    if (cqe.res >= 0) return;
-    switch (cqe.err()) {
+// --- `IO` callbacks. Each recovers the slot from `context` and reports which
+//     of its completions fired; all handshake logic lives on `Handshake`. ---
+
+fn on_io_completion(context: ?*anyopaque, completion: *io_uring.Completion, result: i32) void {
+    _ = completion;
+    assert(context != null);
+    const slot: *Handshake = @ptrCast(@alignCast(context.?));
+    slot.on_completion(.io, result);
+}
+
+fn on_timeout_completion(context: ?*anyopaque, completion: *io_uring.Completion, result: i32) void {
+    _ = completion;
+    assert(context != null);
+    const slot: *Handshake = @ptrCast(@alignCast(context.?));
+    slot.on_completion(.timeout, result);
+}
+
+fn on_cancel_completion(context: ?*anyopaque, completion: *io_uring.Completion, result: i32) void {
+    _ = completion;
+    assert(context != null);
+    const slot: *Handshake = @ptrCast(@alignCast(context.?));
+    slot.on_completion(.cancel, result);
+}
+
+fn on_close_completion(context: ?*anyopaque, completion: *io_uring.Completion, result: i32) void {
+    _ = completion;
+    assert(context != null);
+    const slot: *Handshake = @ptrCast(@alignCast(context.?));
+    slot.on_completion(.close, result);
+}
+
+/// Map a failed completion `result` (`result` < 0) to an error.
+fn check_result(result: i32) DialError!void {
+    if (result >= 0) return;
+    switch (io_uring.errno_from(result)) {
         .CONNREFUSED => return error.ConnectionRefused,
         .TIMEDOUT => return error.Timeout,
         .NETUNREACH, .NETDOWN => return error.NetworkUnreachable,

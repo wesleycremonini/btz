@@ -3,7 +3,7 @@
 //!
 //! `connect_all` hands `PeerLog` one dialed peer at a time as its handshake
 //! settles; `emit` renders the record into a caller-owned line buffer and queues
-//! its `IORING_OP_WRITE`. Each queued line keeps its own buffer and SQE identity
+//! its `IORING_OP_WRITE`. Each queued line keeps its own buffer and completion
 //! reserved until its write CQE drains. Nothing is allocated: `lines` is backed
 //! by a caller array sized to the address count, so a free slot is always
 //! available and no line is ever recycled.
@@ -14,8 +14,7 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const net = std.Io.net;
 const io_uring = @import("io.zig");
-const handshake = @import("handshake.zig");
-const DialError = handshake.DialError;
+const DialError = @import("handshake.zig").DialError;
 const PeerInfo = @import("version.zig").PeerInfo;
 const max_user_agent_len = @import("version.zig").max_user_agent_len;
 const log = std.log.scoped(.p2p);
@@ -49,10 +48,10 @@ pub const PeerLog = struct {
     /// Lines a failed write CQE lost.
     dropped: u32,
 
-    /// One framed record line: its rendered bytes and the SQE identity for its
+    /// One framed record line: its rendered bytes and the completion for its
     /// write. `written` tracks progress so a short write re-arms only the tail.
     pub const Line = struct {
-        completion: handshake.Completion,
+        completion: io_uring.Completion,
         offset: u64,
         len: u32,
         written: u32,
@@ -96,54 +95,64 @@ pub const PeerLog = struct {
         assert(rendered.len > 0);
         assert(rendered.len <= line_bytes_max);
 
-        line.completion = .{ .slot = null, .kind = .log_write };
         line.offset = peer_log.offset;
         line.len = @intCast(rendered.len);
         line.written = 0;
         peer_log.offset += line.len;
 
-        // The ring is sized (`min_ring_entries`) so the SQ can never be full.
-        peer_log.io.prep_write(
-            user_data_of(&line.completion),
+        peer_log.io.write(
+            &line.completion,
             peer_log.fd,
             line.buffer[0..line.len],
             line.offset,
-        ) catch unreachable;
+            peer_log,
+            on_write_completion,
+        );
         peer_log.in_flight += 1;
     }
 
     /// One write CQE landed: advance the line, re-arming its tail on a short
     /// write and counting a failed write as a dropped line.
-    pub fn on_write_complete(peer_log: *PeerLog, completion: *handshake.Completion, cqe: linux.io_uring_cqe) void {
+    pub fn on_write_complete(peer_log: *PeerLog, completion: *io_uring.Completion, result: i32) void {
         assert(peer_log.in_flight > 0);
         peer_log.in_flight -= 1;
 
         const line: *Line = @fieldParentPtr("completion", completion);
         assert(line.written < line.len);
 
-        if (cqe.res <= 0) {
-            log.err("record write at offset {d} failed: {t}", .{ line.offset, cqe.err() });
+        if (result <= 0) {
+            if (result < 0) {
+                log.err("record write at offset {d} failed: {t}", .{
+                    line.offset, io_uring.errno_from(result),
+                });
+            } else {
+                log.err("record write at offset {d} returned 0", .{line.offset});
+            }
             peer_log.dropped += 1;
             return;
         }
 
-        const wrote: u32 = @intCast(cqe.res);
+        const wrote: u32 = @intCast(result);
         assert(wrote <= line.len - line.written);
         line.written += wrote;
         if (line.written == line.len) return;
 
-        peer_log.io.prep_write(
-            user_data_of(&line.completion),
+        peer_log.io.write(
+            &line.completion,
             peer_log.fd,
             line.buffer[line.written..line.len],
             line.offset + line.written,
-        ) catch unreachable;
+            peer_log,
+            on_write_completion,
+        );
         peer_log.in_flight += 1;
     }
 };
 
-fn user_data_of(completion: *const handshake.Completion) u64 {
-    return @intCast(@intFromPtr(completion));
+fn on_write_completion(context: ?*anyopaque, completion: *io_uring.Completion, result: i32) void {
+    assert(context != null);
+    const peer_log: *PeerLog = @ptrCast(@alignCast(context.?));
+    peer_log.on_write_complete(completion, result);
 }
 
 /// Render one record line to `writer`: `<addr>\tok\t<version>\t0x<services>\t<ua>`

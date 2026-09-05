@@ -29,12 +29,12 @@ const handshake_target = 4;
 const seed_addresses_max = 32;
 /// Addresses a single DNS-seed lookup may contribute.
 const dns_addresses_max = 32;
-/// io_uring SQ depth, sized so `connect_all` never fills the queue.
+/// io_uring SQ depth, sized so `connect_all` rarely parks a completion.
 const ring_entries = 256;
 
 comptime {
     assert(std.math.isPowerOfTwo(ring_entries));
-    assert(ring_entries >= crawl.min_ring_entries(concurrency, seed_addresses_max));
+    assert(ring_entries >= crawl.min_ring_entries(concurrency));
     assert(concurrency >= 1);
     assert(handshake_target >= 1);
     assert(handshake_target <= seed_addresses_max);
@@ -59,7 +59,7 @@ pub fn main(init: std.process.Init) !void {
         addresses.len, handshake_target, concurrency,
     });
 
-    var io: io_uring.IO = try .init(ring_entries);
+    var io: io_uring.IO = try .init(ring_entries, 0);
     defer io.deinit();
 
     var log_file = Io.Dir.cwd().createFile(init.io, log_path, .{}) catch |err| {
@@ -73,9 +73,9 @@ pub fn main(init: std.process.Init) !void {
     var log_lines: [seed_addresses_max]PeerLog.Line = undefined;
     var peer_log = PeerLog.init(&io, log_file.handle, log_lines[0..addresses.len]);
 
-    // Every handshake runs on this one ring, identified by a pointer stored in
-    // its SQE `user_data`; `connect_all` returns with the ring drained, having
-    // written one `btz.log` line per dialed peer as each settled.
+    // Every handshake runs on this one ring, identified by a completion pointer
+    // stored in its SQE `user_data`; `connect_all` returns with the ring
+    // drained, having written one `btz.log` line per dialed peer as it settled.
     var slots: [concurrency]handshake.Handshake = undefined;
     const summary = crawl.connect_all(
         &io,
