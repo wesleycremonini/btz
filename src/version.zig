@@ -35,7 +35,11 @@ pub const Options = struct {
     user_agent: []const u8 = "/btz:0.1.0/",
     /// Network magic.
     magic: u32 = message.mainnet_magic,
-    /// Whole-handshake deadline in nanoseconds.
+    /// Whole-conversation deadline in nanoseconds. Connect and handshake take
+    /// well under a second on a reachable node, but Bitcoin Core answers
+    /// `getaddr` on a delayed relay timer, so the window must be wide enough to
+    /// catch that reply. A dead host still costs the full deadline — high
+    /// `concurrency` is what keeps those from stalling the crawl.
     timeout_ns: u63 = 10 * std.time.ns_per_s,
 };
 
@@ -104,7 +108,9 @@ pub fn parse_version(peer: *PeerInfo, payload: []const u8) ParseError!void {
     assert(peer.user_agent_len <= peer.user_agent_buffer.len);
 }
 
-fn unix_seconds() i64 {
+/// Wall-clock seconds since the Unix epoch. `std.time` in 0.16 has no
+/// timestamp helper, so read the clock directly.
+pub fn unix_seconds() i64 {
     var now: linux.timespec = undefined;
     const rc = linux.clock_gettime(.REALTIME, &now);
     assert(linux.errno(rc) == .SUCCESS);

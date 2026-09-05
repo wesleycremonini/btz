@@ -22,23 +22,25 @@ pub const std_options: std.Options = .{
     },
 };
 
-/// Conversations kept in flight on the ring at once.
-const concurrency = 8;
+/// Conversations kept in flight on the ring at once. Each holds one socket and
+/// a ~40 KiB slot; io_uring scales far past this, so the practical ceiling is
+/// `ulimit -n` and how aggressive a burst of outbound SYNs the network allows.
+const concurrency = 512;
 /// Dials to start before the crawl stops (the frontier may still hold more).
-const dial_max = 128;
+const dial_max = 2000;
 /// Seed addresses resolved from DNS before the crawl starts.
 const seed_addresses_max = 32;
 /// Addresses a single DNS-seed lookup may contribute.
 const dns_addresses_max = 32;
 /// Frontier queue capacity: addresses discovered but not yet dialed.
-const frontier_capacity = 4096;
+const frontier_capacity = 16384;
 /// Seen-set capacity (a power of two): every address ever enqueued. Sized well
 /// above `dial_max` plus the discoveries it can turn up so the set never fills.
-const seen_capacity = 1 << 16;
-/// io_uring SQ depth. Each conversation holds only a few SQEs and each settling
-/// one queues a record write, so 256 is roomy; an undersized ring only makes
-/// `IO` park the overflow on its unqueued list, never fail.
-const ring_entries = 256;
+const seen_capacity = 1 << 18;
+/// io_uring SQ depth. Each conversation holds a few SQEs and each settling one
+/// queues a record write, so budget several per slot; an undersized ring only
+/// makes `IO` park the overflow on its unqueued list, never fail.
+const ring_entries = 8192;
 
 comptime {
     assert(std.math.isPowerOfTwo(ring_entries));

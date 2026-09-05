@@ -29,10 +29,11 @@ comptime {
 }
 
 /// Parse an `addr` payload, writing the IPv4 addresses it names into `out`.
-/// Returns the count written (`<= out.len`). Best-effort: a count over
-/// `entries_max` yields none, and a truncated tail yields the entries read so
-/// far.
-pub fn parse_addr(payload: []const u8, out: []net.IpAddress) u32 {
+/// Entries whose timestamp is before `min_time` (unix seconds) are skipped —
+/// a stale address is far likelier to be offline than reachable. Returns the
+/// count written (`<= out.len`). Best-effort: a count over `entries_max`
+/// yields none, and a truncated tail yields the entries read so far.
+pub fn parse_addr(payload: []const u8, out: []net.IpAddress, min_time: u32) u32 {
     assert(out.len >= 1);
     assert(out.len <= std.math.maxInt(u32));
     const out_len: u32 = @intCast(out.len);
@@ -51,6 +52,8 @@ pub fn parse_addr(payload: []const u8, out: []net.IpAddress) u32 {
         const entry = payload[offset..][0..entry_len];
         offset += entry_len;
 
+        const entry_time = std.mem.readInt(u32, entry[0..4], .little);
+        if (entry_time < min_time) continue;
         const ipv4 = ipv4_of(entry[12..28]) orelse continue;
         const port = std.mem.readInt(u16, entry[28..30], .big);
         out[written] = .{ .ip4 = .{ .bytes = ipv4, .port = port } };
@@ -70,9 +73,11 @@ fn ipv4_of(bytes: *const [16]u8) ?[4]u8 {
 
 const testing = std.testing;
 
-/// Build one 30-byte `addr` entry into `out` with `ip` (16 bytes) and `port`.
-fn write_entry(out: *[entry_len]u8, ip: [16]u8, port: u16) void {
-    @memset(out[0..12], 0); // time + services, unused
+/// Build one 30-byte `addr` entry into `out`: `time`, then `ip` (16 bytes) and
+/// `port`. Services are left zero.
+fn write_entry(out: *[entry_len]u8, time: u32, ip: [16]u8, port: u16) void {
+    std.mem.writeInt(u32, out[0..4], time, .little);
+    @memset(out[4..12], 0); // services, unused
     @memcpy(out[12..28], &ip);
     std.mem.writeInt(u16, out[28..30], port, .big);
 }
@@ -84,38 +89,54 @@ fn v4_mapped(a: u8, b: u8, c: u8, d: u8) [16]u8 {
 test "parse_addr: keeps IPv4-mapped entries and skips a native IPv6 one" {
     var payload: [1 + 3 * entry_len]u8 = undefined;
     payload[0] = 3; // CompactSize count
-    write_entry(payload[1..][0..entry_len], v4_mapped(1, 2, 3, 4), 8333);
-    write_entry(payload[1 + entry_len ..][0..entry_len], .{ 0x20, 0x01 } ++ .{0} ** 14, 8333);
-    write_entry(payload[1 + 2 * entry_len ..][0..entry_len], v4_mapped(9, 9, 9, 9), 18333);
+    write_entry(payload[1..][0..entry_len], 100, v4_mapped(1, 2, 3, 4), 8333);
+    write_entry(payload[1 + entry_len ..][0..entry_len], 100, .{ 0x20, 0x01 } ++ .{0} ** 14, 8333);
+    write_entry(payload[1 + 2 * entry_len ..][0..entry_len], 100, v4_mapped(9, 9, 9, 9), 18333);
 
     var out: [8]net.IpAddress = undefined;
-    const written = parse_addr(&payload, &out);
+    const written = parse_addr(&payload, &out, 0);
     try testing.expectEqual(@as(u32, 2), written);
     try testing.expectEqual(net.IpAddress{ .ip4 = .{ .bytes = .{ 1, 2, 3, 4 }, .port = 8333 } }, out[0]);
     try testing.expectEqual(net.IpAddress{ .ip4 = .{ .bytes = .{ 9, 9, 9, 9 }, .port = 18333 } }, out[1]);
 }
 
+test "parse_addr: skips entries older than min_time" {
+    var payload: [1 + 3 * entry_len]u8 = undefined;
+    payload[0] = 3;
+    write_entry(payload[1..][0..entry_len], 1500, v4_mapped(1, 1, 1, 1), 8333);
+    write_entry(payload[1 + entry_len ..][0..entry_len], 999, v4_mapped(2, 2, 2, 2), 8333); // stale
+    write_entry(payload[1 + 2 * entry_len ..][0..entry_len], 5000, v4_mapped(3, 3, 3, 3), 8333);
+
+    var out: [8]net.IpAddress = undefined;
+    const written = parse_addr(&payload, &out, 1000);
+    try testing.expectEqual(@as(u32, 2), written);
+    try testing.expectEqual(net.IpAddress{ .ip4 = .{ .bytes = .{ 1, 1, 1, 1 }, .port = 8333 } }, out[0]);
+    try testing.expectEqual(net.IpAddress{ .ip4 = .{ .bytes = .{ 3, 3, 3, 3 }, .port = 8333 } }, out[1]);
+}
+
 test "parse_addr: stops when out is full" {
     var payload: [1 + 3 * entry_len]u8 = undefined;
     payload[0] = 3;
-    for (0..3) |i| write_entry(payload[1 + i * entry_len ..][0..entry_len], v4_mapped(10, 0, 0, @intCast(i)), 8333);
+    for (0..3) |i| {
+        write_entry(payload[1 + i * entry_len ..][0..entry_len], 100, v4_mapped(10, 0, 0, @intCast(i)), 8333);
+    }
 
     var out: [2]net.IpAddress = undefined;
-    try testing.expectEqual(@as(u32, 2), parse_addr(&payload, &out));
+    try testing.expectEqual(@as(u32, 2), parse_addr(&payload, &out, 0));
 }
 
 test "parse_addr: rejects an over-large count" {
     var payload: [3]u8 = .{ 0xfd, 0xe9, 0x03 }; // CompactSize 1001
     var out: [4]net.IpAddress = undefined;
-    try testing.expectEqual(@as(u32, 0), parse_addr(&payload, &out));
+    try testing.expectEqual(@as(u32, 0), parse_addr(&payload, &out, 0));
 }
 
 test "parse_addr: a truncated tail yields the entries already read" {
     var payload: [1 + entry_len + 5]u8 = undefined;
     payload[0] = 2; // claims two, only one entry's worth of bytes follows
-    write_entry(payload[1..][0..entry_len], v4_mapped(7, 7, 7, 7), 8333);
+    write_entry(payload[1..][0..entry_len], 100, v4_mapped(7, 7, 7, 7), 8333);
     @memset(payload[1 + entry_len ..], 0);
 
     var out: [4]net.IpAddress = undefined;
-    try testing.expectEqual(@as(u32, 1), parse_addr(&payload, &out));
+    try testing.expectEqual(@as(u32, 1), parse_addr(&payload, &out, 0));
 }

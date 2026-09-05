@@ -32,6 +32,12 @@ pub const Peer = connection.Connection(Protocol);
 /// without an outsized slot.
 pub const discovered_max = 256;
 
+/// `addr` entries older than this are skipped. Bitcoin Core keeps an address
+/// in its tables for ~30 days and only re-times it when it reconnects, so the
+/// cutoff must be lenient: this just drops the genuinely ancient ones that are
+/// nearly always offline, without gutting a `getaddr` reply.
+const addr_max_age_s = 10 * 24 * 60 * 60;
+
 /// Receive buffer. Must hold the largest single message we parse whole — a
 /// full `addr` — plus its header; other messages are consumed and dropped.
 const recv_buffer_len = header_len + addr.addr_payload_max;
@@ -209,7 +215,7 @@ pub const Protocol = struct {
             protocol.verack_received = true;
             log.debug("<- verack", .{});
         } else if (protocol.getaddr_sent and message.command_eql(command, "addr")) {
-            protocol.discovered_len = addr.parse_addr(payload, &protocol.discovered);
+            protocol.discovered_len = addr.parse_addr(payload, &protocol.discovered, min_addr_time());
             protocol.addr_received = true;
         } else {
             log.debug("<- {s} ({d} bytes, ignored)", .{
@@ -231,3 +237,11 @@ pub const Protocol = struct {
         protocol.recv_len = rest;
     }
 };
+
+/// The oldest `addr` timestamp we will keep: now minus `addr_max_age_s`, or 0
+/// if the clock is somehow before that.
+fn min_addr_time() u32 {
+    const now = version.unix_seconds();
+    if (now <= addr_max_age_s) return 0;
+    return @intCast(now - addr_max_age_s);
+}
