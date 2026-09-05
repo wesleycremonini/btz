@@ -50,7 +50,8 @@ const cqes_per_dial_max = 128;
 
 /// Dial addresses from `frontier`, keeping up to `slots.len` conversations in
 /// flight on the shared `io` ring, feeding each peer's disclosed addresses back
-/// onto `frontier`, and stopping once `dial_max` dials have started or the
+/// onto `frontier`. Stops starting new dials once any of: `dial_max` have
+/// started, `ok_target` have succeeded (`0` = no success limit), or the
 /// frontier is empty. Queues exactly one `peer_log` record per dialed peer as
 /// it settles and drains those writes before returning. `slots`, `frontier`,
 /// and the `peer_log` buffers are caller-owned; nothing is allocated.
@@ -60,6 +61,7 @@ pub fn connect_all(
     frontier: *Frontier,
     slots: []Peer,
     dial_max: u32,
+    ok_target: u32,
     options: version.Options,
 ) Summary {
     assert(slots.len >= 1);
@@ -86,7 +88,7 @@ pub fn connect_all(
         for (slots) |*slot| {
             if (slot.status == .settled) reap_slot(slot, peer_log, frontier, &progress);
             if (slot.status == .idle) {
-                fill_slot(io, peer_log, slot, frontier, &progress, dial_max, options);
+                fill_slot(io, peer_log, slot, frontier, &progress, dial_max, ok_target, options);
             }
         }
 
@@ -137,10 +139,12 @@ fn fill_slot(
     frontier: *Frontier,
     progress: *Progress,
     dial_max: u32,
+    ok_target: u32,
     options: version.Options,
 ) void {
     assert(slot.status == .idle);
     while (progress.dialed < dial_max) {
+        if (ok_target != 0 and progress.succeeded >= ok_target) return;
         const address = frontier.pop() orelse return;
 
         const fd = io_uring.open_socket(address) catch |err| {

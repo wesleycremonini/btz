@@ -139,8 +139,17 @@ pub const Protocol = struct {
 
     pub fn on_deadline(protocol: *const Protocol) Directive {
         if (!protocol.verack_received) return .{ .fail = error.ConnectTimeout };
-        // Handshake completed; the getaddr window elapsed with no `addr` reply.
-        return .{ .fail = error.GetaddrTimeout };
+        // Handshake completed: a reachable peer. A missing `addr` reply just
+        // means zero discovered addresses, not a failed dial.
+        return .done;
+    }
+
+    /// Classify a transport error by how far the conversation got. Once the
+    /// handshake is in, the node is reachable and stays a success — a later
+    /// hangup, reset, or step-count blowout does not unmake that.
+    pub fn outcome_for(protocol: *const Protocol, err: DialError) DialError!void {
+        if (protocol.verack_received) return {};
+        return err;
     }
 
     /// Consume whole buffered messages, advancing the conversation. Returns the
@@ -249,7 +258,7 @@ fn min_addr_time(max_age_s: u32) u32 {
     return @intCast(now - max_age_s);
 }
 
-test "deadline budget and timeout outcome switch at verack" {
+test "deadline budget switches at verack; a reached handshake is a success" {
     const testing = std.testing;
     var protocol: Protocol = undefined;
     protocol.reset(
@@ -259,8 +268,10 @@ test "deadline budget and timeout outcome switch at verack" {
 
     try testing.expectEqual(@as(u63, 111), protocol.deadline_ns());
     try testing.expectEqual(Directive{ .fail = error.ConnectTimeout }, protocol.on_deadline());
+    try testing.expectError(error.EndOfStream, protocol.outcome_for(error.EndOfStream));
 
     protocol.verack_received = true;
     try testing.expectEqual(@as(u63, 222), protocol.deadline_ns());
-    try testing.expectEqual(Directive{ .fail = error.GetaddrTimeout }, protocol.on_deadline());
+    try testing.expectEqual(Directive.done, protocol.on_deadline());
+    try protocol.outcome_for(error.EndOfStream); // reachable: no longer a failure
 }

@@ -22,6 +22,7 @@
 //!   fn on_recv(protocol: *Protocol, byte_count: u32) Directive // bytes appended
 //!   fn on_send(protocol: *Protocol) Directive                  // current frame flushed
 //!   fn on_deadline(protocol: *Protocol) Directive              // deadline fired
+//!   fn outcome_for(protocol: *Protocol, err: DialError) DialError!void // classify a transport error
 //!
 //! Nothing is allocated: the caller owns the `Connection` slot, which must not
 //! move while any of its completions is outstanding.
@@ -263,10 +264,12 @@ pub fn Connection(comptime Protocol: type) type {
 
             // Only the I/O op can run away (a message flood); the timer and the
             // update ack fire at most once each.
-            if (connection.steps > steps_max) return connection.finish(error.TooManyCompletions, .io);
+            if (connection.steps > steps_max) {
+                return connection.finish(connection.protocol.outcome_for(error.TooManyCompletions), .io);
+            }
 
             const directive = connection.io_progress(result) catch |err| {
-                return connection.finish(err, .io);
+                return connection.finish(connection.protocol.outcome_for(err), .io);
             };
             if (directive) |next| connection.apply(next, .io);
             if (connection.status == .dialing) connection.refresh_deadline();

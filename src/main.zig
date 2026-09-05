@@ -102,6 +102,7 @@ pub fn main(init: std.process.Init) !void {
         &frontier,
         slots[0..config.concurrency],
         config.dials,
+        config.ok_target,
         options,
     );
 

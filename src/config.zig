@@ -41,6 +41,8 @@ pub const Config = struct {
     concurrency: u32 = 512,
     /// Addresses to dial before the crawl stops.
     dials: u32 = 2000,
+    /// Stop starting dials once this many succeed (0 = dial the whole budget).
+    ok_target: u32 = 0,
     /// Deadline for TCP connect plus the version/verack handshake, ms.
     connect_timeout_ms: u32 = 3_000,
     /// Deadline for the peer's `addr` reply after the handshake, ms.
@@ -104,6 +106,7 @@ pub fn usage() void {
         \\  --network <name>          mainnet | testnet3 | signet    (mainnet)
         \\  --concurrency <n>         conversations in flight        (512, max 2048)
         \\  --dials <n>               addresses to dial, total       (2000)
+        \\  --ok-target <n>           stop after this many succeed   (0 = no limit)
         \\  --connect-timeout-ms <n>  connect + handshake deadline   (3000)
         \\  --getaddr-timeout-ms <n>  addr-reply deadline after that (15000)
         \\  --out <path>              record file                    (btz.log)
@@ -122,11 +125,11 @@ pub fn usage() void {
 /// Every accepted flag name (without the `--`). Kept beside `apply` so the two
 /// stay in step: `is_known` gates on this list, `apply`'s `else` is a backstop.
 const flag_names = [_][]const u8{
-    "concurrency",        "dials",             "connect-timeout-ms",
-    "getaddr-timeout-ms", "out",               "user-agent",
-    "network",            "protocol-version",  "services",
-    "addr-max-age-days",  "frontier-capacity", "seen-capacity",
-    "ring-entries",
+    "concurrency",        "dials",              "ok-target",
+    "connect-timeout-ms", "getaddr-timeout-ms", "out",
+    "user-agent",         "network",            "protocol-version",
+    "services",           "addr-max-age-days",  "frontier-capacity",
+    "seen-capacity",      "ring-entries",
 };
 
 fn is_known(name: []const u8) bool {
@@ -151,6 +154,8 @@ fn apply(config: *Config, name: []const u8, value: []const u8) Error!void {
         config.concurrency = try to_u32(name, value);
     } else if (eql(name, "dials")) {
         config.dials = try to_u32(name, value);
+    } else if (eql(name, "ok-target")) {
+        config.ok_target = try to_u32(name, value);
     } else if (eql(name, "connect-timeout-ms")) {
         config.connect_timeout_ms = try to_u32(name, value);
     } else if (eql(name, "getaddr-timeout-ms")) {
@@ -192,6 +197,7 @@ fn apply(config: *Config, name: []const u8, value: []const u8) Error!void {
 fn validate(config: *const Config) Error!void {
     try in_range("concurrency", config.concurrency, 1, concurrency_max);
     try in_range("dials", config.dials, 1, dials_max);
+    try in_range("ok-target", config.ok_target, 0, dials_max);
     try in_range("connect-timeout-ms", config.connect_timeout_ms, 1, timeout_ms_max);
     try in_range("getaddr-timeout-ms", config.getaddr_timeout_ms, 1, timeout_ms_max);
     try in_range("frontier-capacity", config.frontier_capacity, 1, frontier_capacity_max);

@@ -22,15 +22,14 @@ pub const DialError = error{
     MessageTooLarge,
     /// The peer's `version` payload was too short or internally inconsistent.
     MalformedVersion,
-    /// The peer closed the connection mid-handshake.
+    /// The peer closed the connection before the handshake completed.
     EndOfStream,
     /// TCP connect and the version/verack handshake did not complete within
     /// the connect deadline — the host is unreachable, firewalled, or gone.
+    /// (Once the handshake is in, the peer counts as reachable and no later
+    /// timeout or transport error can fail the dial.)
     ConnectTimeout,
-    /// The handshake completed but no `addr` reply arrived within the getaddr
-    /// deadline — the peer is alive but did not (or would not) share addresses.
-    GetaddrTimeout,
-    /// The conversation ran through too many I/O steps without finishing.
+    /// The handshake ran through too many I/O steps without completing.
     TooManyCompletions,
     /// The connect / send / recv operation failed at the transport layer.
     ConnectionRefused,
