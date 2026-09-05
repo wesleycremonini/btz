@@ -9,10 +9,23 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+/// A Bitcoin P2P network. Selects the wire magic, the default port, and the
+/// DNS seed list (see `seeds.zig`).
+pub const Network = enum { mainnet, testnet3, signet };
+
 /// Network magic prefixing every message on each network.
 pub const mainnet_magic: u32 = 0xd9b4bef9;
 pub const testnet3_magic: u32 = 0x0709110b;
 pub const signet_magic: u32 = 0x40cf030a;
+
+/// The wire magic for `network`.
+pub fn magic_for(network: Network) u32 {
+    return switch (network) {
+        .mainnet => mainnet_magic,
+        .testnet3 => testnet3_magic,
+        .signet => signet_magic,
+    };
+}
 
 // Message-header layout, in bytes.
 pub const magic_len = 4;

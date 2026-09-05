@@ -3,104 +3,109 @@ const assert = std.debug.assert;
 const Io = std.Io;
 const net = std.Io.net;
 
+const config_mod = @import("config.zig");
+const message = @import("message.zig");
 const session = @import("session.zig");
 const crawl = @import("crawl.zig");
 const io_uring = @import("io.zig");
 const seeds = @import("seeds.zig");
+const version = @import("version.zig");
 const PeerLog = @import("peer_log.zig").PeerLog;
 const Frontier = @import("frontier.zig").Frontier;
 const log = std.log.scoped(.main);
 
-/// One line per dialed peer is written here; truncated at the start of each run.
-const log_path = "btz.log";
-
 /// The conversation narrates each step on the `.p2p` scope at `debug`; the peer
-/// record lives in `log_path`, so keep that scope quiet by default.
+/// record lives in the record file, so keep that scope quiet by default.
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{
         .{ .scope = .p2p, .level = .warn },
     },
 };
 
-/// Conversations kept in flight on the ring at once. Each holds one socket and
-/// a ~40 KiB slot; io_uring scales far past this, so the practical ceiling is
-/// `ulimit -n` and how aggressive a burst of outbound SYNs the network allows.
-const concurrency = 512;
-/// Dials to start before the crawl stops (the frontier may still hold more).
-const dial_max = 2000;
 /// Seed addresses resolved from DNS before the crawl starts.
-const seed_addresses_max = 32;
+const seed_addresses_max = 128;
 /// Addresses a single DNS-seed lookup may contribute.
-const dns_addresses_max = 32;
-/// Frontier queue capacity: addresses discovered but not yet dialed.
-const frontier_capacity = 16384;
-/// Seen-set capacity (a power of two): every address ever enqueued. Sized well
-/// above `dial_max` plus the discoveries it can turn up so the set never fills.
-const seen_capacity = 1 << 18;
-/// io_uring SQ depth. Each conversation holds a few SQEs and each settling one
-/// queues a record write, so budget several per slot; an undersized ring only
-/// makes `IO` park the overflow on its unqueued list, never fail.
-const ring_entries = 8192;
+const dns_addresses_max = 64;
 
-comptime {
-    assert(std.math.isPowerOfTwo(ring_entries));
-    assert(std.math.isPowerOfTwo(seen_capacity));
-    assert(concurrency >= 1);
-    assert(dial_max >= 1);
-    assert(seed_addresses_max >= 1);
-    assert(dns_addresses_max >= 1);
-    assert(frontier_capacity >= seed_addresses_max);
-}
-
-// Static storage: allocated at startup, never grown (TigerStyle).
-var slots: [concurrency]session.Peer = undefined;
-// Recycled, so sized to the peak of in-flight record writes -- a few per
-// concurrent conversation -- not to `dial_max`.
-var log_lines: [4 * concurrency]PeerLog.Line = undefined;
-var frontier_queue: [frontier_capacity]net.IpAddress = undefined;
-var seen_table: [seen_capacity]u32 = @splat(0);
+// Static storage: allocated at startup, never grown (TigerStyle). Each array is
+// sized to its compile-time ceiling in `config.zig`; a run touches only the
+// prefix its flags select, and the untouched pages cost nothing.
+var slots: [config_mod.concurrency_max]session.Peer = undefined;
+var log_lines: [4 * config_mod.concurrency_max]PeerLog.Line = undefined;
+var frontier_queue: [config_mod.frontier_capacity_max]net.IpAddress = undefined;
+var seen_table: [config_mod.seen_capacity_max]u32 = @splat(0);
 
 pub fn main(init: std.process.Init) !void {
-    const port = seeds.mainnet_port;
+    var args = std.process.Args.Iterator.init(init.minimal.args);
+    defer args.deinit();
+    _ = args.skip(); // the program name
 
+    const config = config_mod.parse(&args) catch |err| {
+        if (err == error.HelpRequested) {
+            config_mod.usage();
+            return;
+        }
+        // `parse` already printed the specific reason.
+        std.debug.print("btz: run 'btz --help' for options\n", .{});
+        std.process.exit(2);
+    };
+
+    const network = config.network;
     var address_buffer: [seed_addresses_max]net.IpAddress = undefined;
     const seed_addresses = collect_seed_addresses(
         init.io,
         &address_buffer,
-        &seeds.mainnet_dns_seeds,
-        port,
+        seeds.seeds_for(network),
+        seeds.port_for(network),
     );
     if (seed_addresses.len == 0) {
         log.err("no seed addresses resolved", .{});
         return error.NoSeedAddresses;
     }
 
-    var frontier = Frontier.init(&frontier_queue, &seen_table);
+    var frontier = Frontier.init(
+        frontier_queue[0..config.frontier_capacity],
+        seen_table[0..config.seen_capacity],
+    );
     for (seed_addresses) |seed_address| _ = frontier.push(seed_address);
-    log.info("seeded {d} address(es); dialing up to {d}, {d} in flight", .{
-        frontier.enqueued, dial_max, concurrency,
+    log.info("network {t}: seeded {d}, dialing up to {d}, {d} in flight", .{
+        network, frontier.enqueued, config.dials, config.concurrency,
     });
 
-    var io: io_uring.IO = try .init(ring_entries, 0);
+    var io: io_uring.IO = try .init(@intCast(config.ring_entries), 0);
     defer io.deinit();
 
-    var log_file = Io.Dir.cwd().createFile(init.io, log_path, .{}) catch |err| {
-        log.err("create {s}: {t}", .{ log_path, err });
+    var log_file = Io.Dir.cwd().createFile(init.io, config.out_path, .{}) catch |err| {
+        log.err("create {s}: {t}", .{ config.out_path, err });
         return err;
     };
     defer log_file.close(init.io);
 
-    // One record line per dialed address, written onto `io` as `IORING_OP_WRITE`s
-    // so the crawl loop never blocks on the log file.
-    var peer_log = PeerLog.init(&io, log_file.handle, &log_lines);
+    var peer_log = PeerLog.init(&io, log_file.handle, log_lines[0 .. 4 * config.concurrency]);
+
+    const options: version.Options = .{
+        .protocol_version = config.protocol_version,
+        .services = config.services,
+        .user_agent = config.user_agent,
+        .magic = message.magic_for(network),
+        .timeout_ns = @as(u63, config.timeout_ms) * std.time.ns_per_ms,
+        .addr_max_age_s = config.addr_max_age_s,
+    };
 
     // Every conversation runs on this one ring, identified by a completion
     // pointer in its SQE `user_data`; `connect_all` returns with the ring
-    // drained, having written one `btz.log` line per dialed peer as it settled.
-    const summary = crawl.connect_all(&io, &peer_log, &frontier, &slots, dial_max, .{});
+    // drained, having written one record line per dialed peer as it settled.
+    const summary = crawl.connect_all(
+        &io,
+        &peer_log,
+        &frontier,
+        slots[0..config.concurrency],
+        config.dials,
+        options,
+    );
 
     log.info("wrote {s}: {d} ok / {d} dialed, {d} discovered, {d} record(s) dropped", .{
-        log_path, summary.succeeded, summary.dialed, summary.discovered, summary.dropped,
+        config.out_path, summary.succeeded, summary.dialed, summary.discovered, summary.dropped,
     });
     if (summary.succeeded == 0) return error.AllHandshakesFailed;
 }
@@ -157,6 +162,7 @@ test {
     _ = @import("message.zig");
     _ = @import("version.zig");
     _ = @import("peer.zig");
+    _ = @import("config.zig");
     _ = @import("addr.zig");
     _ = @import("frontier.zig");
     _ = @import("connection.zig");

@@ -26,6 +26,9 @@ comptime {
     assert(version_payload_max <= message.message_payload_max);
 }
 
+/// Parameters for one dial. Named for the `version` message it mostly shapes,
+/// but also carries the transport deadline and one crawl knob, since this is
+/// the struct threaded to every conversation.
 pub const Options = struct {
     /// Protocol version to advertise (70016 = wtxid relay, BIP-339).
     protocol_version: i32 = 70016,
@@ -41,6 +44,10 @@ pub const Options = struct {
     /// catch that reply. A dead host still costs the full deadline — high
     /// `concurrency` is what keeps those from stalling the crawl.
     timeout_ns: u63 = 10 * std.time.ns_per_s,
+    /// `addr` entries older than this many seconds are dropped rather than
+    /// dialed. Bitcoin Core keeps an address ~30 days and only re-times it on
+    /// reconnect, so the cutoff must be lenient.
+    addr_max_age_s: u32 = 10 * 24 * 60 * 60,
 };
 
 /// Serialize our `version` payload into `buffer` and return the written prefix.
