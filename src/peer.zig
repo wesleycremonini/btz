@@ -24,9 +24,13 @@ pub const DialError = error{
     MalformedVersion,
     /// The peer closed the connection mid-handshake.
     EndOfStream,
-    /// The handshake did not finish within its deadline.
-    Timeout,
-    /// The handshake ran through too many I/O steps without finishing.
+    /// TCP connect and the version/verack handshake did not complete within
+    /// the connect deadline — the host is unreachable, firewalled, or gone.
+    ConnectTimeout,
+    /// The handshake completed but no `addr` reply arrived within the getaddr
+    /// deadline — the peer is alive but did not (or would not) share addresses.
+    GetaddrTimeout,
+    /// The conversation ran through too many I/O steps without finishing.
     TooManyCompletions,
     /// The connect / send / recv operation failed at the transport layer.
     ConnectionRefused,

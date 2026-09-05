@@ -70,7 +70,8 @@ pub fn connect_all(
     assert(options.magic != 0);
     assert(options.user_agent.len > 0);
     assert(options.user_agent.len <= max_user_agent_len);
-    assert(options.timeout_ns > 0);
+    assert(options.connect_timeout_ns > 0);
+    assert(options.getaddr_timeout_ns > 0);
 
     for (slots) |*slot| slot.status = .idle;
     var progress: Progress = .{ .dialed = 0, .succeeded = 0 };
@@ -148,7 +149,7 @@ fn fill_slot(
             progress.dialed += 1;
             continue;
         };
-        slot.start(io, fd, address, options.timeout_ns, options) catch |err| {
+        slot.start(io, fd, address, options) catch |err| {
             log.warn("start dial with {f}: {t}", .{ address, err });
             io_uring.close_socket(fd); // no SQE armed yet: synchronous close
             peer_log.emit(address, error.SocketUnavailable, null, 0);

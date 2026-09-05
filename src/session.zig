@@ -128,11 +128,19 @@ pub const Protocol = struct {
         return protocol.pump();
     }
 
-    pub fn on_deadline(protocol: *Protocol) Directive {
-        // Past verack the record is already usable: a slow or silent `getaddr`
-        // is not a failure, just zero discovered addresses.
-        if (protocol.verack_received) return .done;
-        return .{ .fail = error.Timeout };
+    /// The deadline budget for the phase we are in: a tight one to reach the
+    /// peer and finish the handshake, then a longer one to wait out `getaddr`.
+    pub fn deadline_ns(protocol: *const Protocol) u63 {
+        return if (protocol.verack_received)
+            protocol.options.getaddr_timeout_ns
+        else
+            protocol.options.connect_timeout_ns;
+    }
+
+    pub fn on_deadline(protocol: *const Protocol) Directive {
+        if (!protocol.verack_received) return .{ .fail = error.ConnectTimeout };
+        // Handshake completed; the getaddr window elapsed with no `addr` reply.
+        return .{ .fail = error.GetaddrTimeout };
     }
 
     /// Consume whole buffered messages, advancing the conversation. Returns the
@@ -239,4 +247,20 @@ fn min_addr_time(max_age_s: u32) u32 {
     const now = version.unix_seconds();
     if (now <= max_age_s) return 0;
     return @intCast(now - max_age_s);
+}
+
+test "deadline budget and timeout outcome switch at verack" {
+    const testing = std.testing;
+    var protocol: Protocol = undefined;
+    protocol.reset(
+        .{ .ip4 = .{ .bytes = .{ 1, 2, 3, 4 }, .port = 8333 } },
+        .{ .connect_timeout_ns = 111, .getaddr_timeout_ns = 222 },
+    );
+
+    try testing.expectEqual(@as(u63, 111), protocol.deadline_ns());
+    try testing.expectEqual(Directive{ .fail = error.ConnectTimeout }, protocol.on_deadline());
+
+    protocol.verack_received = true;
+    try testing.expectEqual(@as(u63, 222), protocol.deadline_ns());
+    try testing.expectEqual(Directive{ .fail = error.GetaddrTimeout }, protocol.on_deadline());
 }

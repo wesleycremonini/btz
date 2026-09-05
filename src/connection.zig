@@ -1,21 +1,27 @@
 //! Generic request/response transport over one io_uring-driven TCP socket.
 //!
-//! `Connection(Protocol)` owns a socket fd, four `io_uring.Completion`s, and a
-//! whole-conversation deadline. It runs `connect`, then hands the wire to
+//! `Connection(Protocol)` owns a socket fd, five `io_uring.Completion`s, and a
+//! single re-armable deadline. It runs `connect`, then hands the wire to
 //! `Protocol` — a pure state machine that, fed received bytes and send /
 //! deadline events, returns a `Directive` for what to do next. The
 //! `idle -> dialing -> winding -> closing -> settled` lifecycle, the timer, and
 //! the cancel / close wind-down live here; not one protocol byte is parsed here.
 //!
+//! The deadline is one `IORING_OP_TIMEOUT` re-armed in place (via
+//! `timeout_update`) whenever `Protocol.deadline_ns` reports a new budget — so a
+//! protocol can run a short connect deadline and then a longer one for a later
+//! phase without a second timer.
+//!
 //! `Protocol` must provide (no I/O, no allocation):
 //!
-//!   pub const Options = ...;                                  // dial parameters
+//!   pub const Options = ...;                                   // dial parameters
 //!   fn reset(protocol: *Protocol, address: net.IpAddress, options: Options) void
-//!   fn connected(protocol: *Protocol) Directive               // TCP connect done
-//!   fn recv_buffer(protocol: *Protocol) []u8                  // where to read (non-empty)
+//!   fn deadline_ns(protocol: *const Protocol) u63              // budget for the current phase
+//!   fn connected(protocol: *Protocol) Directive                // TCP connect done
+//!   fn recv_buffer(protocol: *Protocol) []u8                   // where to read (non-empty)
 //!   fn on_recv(protocol: *Protocol, byte_count: u32) Directive // bytes appended
-//!   fn on_send(protocol: *Protocol) Directive                 // current frame flushed
-//!   fn on_deadline(protocol: *Protocol) Directive             // deadline fired
+//!   fn on_send(protocol: *Protocol) Directive                  // current frame flushed
+//!   fn on_deadline(protocol: *Protocol) Directive              // deadline fired
 //!
 //! Nothing is allocated: the caller owns the `Connection` slot, which must not
 //! move while any of its completions is outstanding.
@@ -35,15 +41,17 @@ const log = std.log.scoped(.p2p);
 const steps_max = 64;
 
 /// Indices into `completions`; each a distinct `user_data` so a CQE names which
-/// SQE finished.
+/// SQE finished. `deadline_update` is the ack for an in-place timer re-arm;
+/// `cancel` retires the surviving op when the conversation ends.
 const completion_io = 0;
 const completion_timeout = 1;
-const completion_cancel = 2;
-const completion_close = 3;
-const completion_count = 4;
+const completion_deadline_update = 2;
+const completion_cancel = 3;
+const completion_close = 4;
+const completion_count = 5;
 
 comptime {
-    assert(completion_count == 4);
+    assert(completion_count == 5);
 }
 
 /// What the protocol wants the connection to do after an event.
@@ -94,15 +102,18 @@ pub fn Connection(comptime Protocol: type) type {
 
         /// Stable storage the connect SQE points at.
         sockaddr: io_uring.SockAddr,
-        /// Relative whole-conversation deadline; copied into the timeout SQE.
-        deadline: linux.kernel_timespec,
+        /// The deadline currently armed on the timer, and the `kernel_timespec`
+        /// the timeout / update SQEs point at. `refresh_deadline` re-arms when
+        /// `Protocol.deadline_ns` returns something else.
+        armed_deadline_ns: u63,
+        deadline_spec: linux.kernel_timespec,
         /// The not-yet-sent tail of the current frame.
         send_frame: []const u8,
 
         /// I/O direction of the live op, distinct from `Status`.
         const Phase = enum { connecting, sending, receiving, done };
         /// Which of the slot's completions a callback is reporting.
-        const Kind = enum { io, timeout, cancel, close };
+        const Kind = enum { io, timeout, deadline_update, cancel, close };
         const ArmOp = enum { timeout, connect, send, recv };
 
         pub fn start(
@@ -110,11 +121,9 @@ pub fn Connection(comptime Protocol: type) type {
             io: *io_uring.IO,
             fd: linux.fd_t,
             address: net.IpAddress,
-            timeout_ns: u63,
             options: Options,
         ) io_uring.SockAddr.FromError!void {
             assert(connection.status == .idle);
-            assert(timeout_ns > 0);
 
             const sockaddr = try io_uring.SockAddr.from(address);
             connection.* = .{
@@ -129,18 +138,27 @@ pub fn Connection(comptime Protocol: type) type {
                 .status = .dialing,
                 .phase = .connecting,
                 .sockaddr = sockaddr,
-                .deadline = .{
-                    .sec = @intCast(timeout_ns / std.time.ns_per_s),
-                    .nsec = @intCast(timeout_ns % std.time.ns_per_s),
-                },
+                .armed_deadline_ns = 0,
+                .deadline_spec = undefined,
                 .send_frame = &.{},
             };
             connection.protocol.reset(address, options);
+            connection.set_deadline(connection.protocol.deadline_ns());
 
             connection.arm(.timeout);
             connection.arm(.connect);
             assert(connection.in_flight == 2);
             log.debug("connecting to {f}", .{address});
+        }
+
+        /// Record `ns` as the armed budget and render it into `deadline_spec`.
+        fn set_deadline(connection: *Self, ns: u63) void {
+            assert(ns > 0);
+            connection.armed_deadline_ns = ns;
+            connection.deadline_spec = .{
+                .sec = @intCast(ns / std.time.ns_per_s),
+                .nsec = @intCast(ns % std.time.ns_per_s),
+            };
         }
 
         /// Queue one SQE and count it against `in_flight`. The shared ring is
@@ -150,7 +168,7 @@ pub fn Connection(comptime Protocol: type) type {
             switch (op) {
                 .timeout => connection.io.timeout(
                     &connection.completions[completion_timeout],
-                    connection.deadline,
+                    connection.deadline_spec,
                     connection,
                     on_timeout_completion,
                 ),
@@ -177,7 +195,28 @@ pub fn Connection(comptime Protocol: type) type {
                 ),
             }
             connection.in_flight += 1;
-            assert(connection.in_flight <= 2);
+            // io op + timer, plus a `deadline_update` ack that may still be
+            // draining from a phase change.
+            assert(connection.in_flight <= 3);
+        }
+
+        /// If the protocol has moved to a phase with a different deadline
+        /// budget, re-arm the timer in place. One extra CQE (the update ack).
+        fn refresh_deadline(connection: *Self) void {
+            assert(connection.status == .dialing);
+            const want = connection.protocol.deadline_ns();
+            if (want == connection.armed_deadline_ns) return;
+
+            connection.set_deadline(want);
+            connection.io.timeout_update(
+                &connection.completions[completion_deadline_update],
+                &connection.completions[completion_timeout],
+                connection.deadline_spec,
+                connection,
+                on_deadline_update_completion,
+            );
+            connection.in_flight += 1;
+            assert(connection.in_flight <= 3);
         }
 
         fn on_completion(connection: *Self, kind: Kind, result: i32) void {
@@ -188,8 +227,9 @@ pub fn Connection(comptime Protocol: type) type {
             switch (connection.status) {
                 .idle, .settled => unreachable,
                 .winding => {
-                    // Outcome already decided; drain the cancelled SQE(s), then
-                    // hand the socket close to the ring and wait on its CQE too.
+                    // Outcome already decided; drain the cancelled SQE(s) and
+                    // the deadline-update ack, then hand the socket close to the
+                    // ring and wait on its CQE too.
                     if (connection.in_flight == 0) {
                         connection.io.close(
                             &connection.completions[completion_close],
@@ -212,19 +252,24 @@ pub fn Connection(comptime Protocol: type) type {
 
         fn step(connection: *Self, kind: Kind, result: i32) void {
             assert(connection.status == .dialing);
-            if (connection.steps > steps_max) return connection.finish(error.TooManyCompletions, kind);
 
             switch (kind) {
                 .cancel => unreachable, // only armed once .winding
                 .close => unreachable, // only armed once .closing
+                .deadline_update => return, // the in-place timer re-arm's ack; nothing to do
                 .timeout => return connection.apply(connection.protocol.on_deadline(), .timeout),
                 .io => {},
             }
+
+            // Only the I/O op can run away (a message flood); the timer and the
+            // update ack fire at most once each.
+            if (connection.steps > steps_max) return connection.finish(error.TooManyCompletions, .io);
 
             const directive = connection.io_progress(result) catch |err| {
                 return connection.finish(err, .io);
             };
             if (directive) |next| connection.apply(next, .io);
+            if (connection.status == .dialing) connection.refresh_deadline();
         }
 
         /// Advance the transport by one I/O completion. Returns the protocol's
@@ -322,6 +367,12 @@ pub fn Connection(comptime Protocol: type) type {
             const connection: *Self = @ptrCast(@alignCast(context.?));
             connection.on_completion(.timeout, result);
         }
+        fn on_deadline_update_completion(context: ?*anyopaque, completion: *io_uring.Completion, result: i32) void {
+            _ = completion;
+            assert(context != null);
+            const connection: *Self = @ptrCast(@alignCast(context.?));
+            connection.on_completion(.deadline_update, result);
+        }
         fn on_cancel_completion(context: ?*anyopaque, completion: *io_uring.Completion, result: i32) void {
             _ = completion;
             assert(context != null);
@@ -342,7 +393,7 @@ fn check_result(result: i32) DialError!void {
     if (result >= 0) return;
     switch (io_uring.errno_from(result)) {
         .CONNREFUSED => return error.ConnectionRefused,
-        .TIMEDOUT => return error.Timeout,
+        .TIMEDOUT => return error.ConnectTimeout,
         .NETUNREACH, .NETDOWN => return error.NetworkUnreachable,
         .HOSTUNREACH => return error.HostUnreachable,
         .CONNRESET, .PIPE => return error.ConnectionResetByPeer,

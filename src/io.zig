@@ -46,6 +46,10 @@ pub const Operation = union(enum) {
     timeout: struct { deadline: linux.kernel_timespec },
     /// Retire a pending `timeout`, named by its completion's address.
     timeout_remove: struct { target: u64 },
+    /// Re-arm a pending `timeout` (named by its completion's address) to fire
+    /// `deadline` from now instead. One CQE — the update's own result; the
+    /// timer keeps its completion and fires later with the new duration.
+    timeout_update: struct { target: u64, deadline: linux.kernel_timespec },
     /// Retire any other pending operation, named by its completion's address.
     cancel: struct { target: u64 },
 };
@@ -242,6 +246,24 @@ pub const IO = struct {
         io.submit(completion, operation, context, callback);
     }
 
+    pub fn timeout_update(
+        io: *IO,
+        completion: *Completion,
+        target: *const Completion,
+        deadline: linux.kernel_timespec,
+        context: ?*anyopaque,
+        callback: Callback,
+    ) void {
+        assert(target != completion);
+        assert(deadline.sec >= 0);
+        assert(deadline.nsec >= 0);
+        const operation: Operation = .{ .timeout_update = .{
+            .target = @intFromPtr(target),
+            .deadline = deadline,
+        } };
+        io.submit(completion, operation, context, callback);
+    }
+
     pub fn cancel(
         io: *IO,
         completion: *Completion,
@@ -333,8 +355,9 @@ pub const IO = struct {
 };
 
 /// Fill `sqe` from `completion.operation` and stamp the completion's address as
-/// `user_data` so `tick` can route the CQE back. `connect` and `timeout` need a
-/// pointer capture so the SQE points into the (stable) completion, not a copy.
+/// `user_data` so `tick` can route the CQE back. `connect`, `timeout`, and
+/// `timeout_update` need a pointer capture so the SQE points into the (stable)
+/// completion, not a copy.
 fn prep(completion: *Completion, sqe: *linux.io_uring_sqe) void {
     switch (completion.operation) {
         .connect => |*operation| sqe.prep_connect(
@@ -348,6 +371,13 @@ fn prep(completion: *Completion, sqe: *linux.io_uring_sqe) void {
         .close => |operation| sqe.prep_close(operation.fd),
         .timeout => |*operation| sqe.prep_timeout(&operation.deadline, 0, 0),
         .timeout_remove => |operation| sqe.prep_timeout_remove(operation.target, 0),
+        .timeout_update => |*operation| {
+            // liburing's io_uring_prep_timeout_update: a TIMEOUT_REMOVE carrying
+            // the UPDATE flag, with the new timespec in `addr2` (which aliases
+            // `off` in the kernel ABI and in this struct).
+            sqe.prep_timeout_remove(operation.target, linux.IORING_TIMEOUT_UPDATE);
+            sqe.off = @intFromPtr(&operation.deadline);
+        },
         .cancel => |operation| sqe.prep_cancel(operation.target, 0),
     }
     sqe.user_data = @intFromPtr(completion);

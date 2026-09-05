@@ -88,7 +88,8 @@ pub fn main(init: std.process.Init) !void {
         .services = config.services,
         .user_agent = config.user_agent,
         .magic = message.magic_for(network),
-        .timeout_ns = @as(u63, config.timeout_ms) * std.time.ns_per_ms,
+        .connect_timeout_ns = @as(u63, config.connect_timeout_ms) * std.time.ns_per_ms,
+        .getaddr_timeout_ns = @as(u63, config.getaddr_timeout_ms) * std.time.ns_per_ms,
         .addr_max_age_s = config.addr_max_age_s,
     };
 

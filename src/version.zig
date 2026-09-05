@@ -38,12 +38,14 @@ pub const Options = struct {
     user_agent: []const u8 = "/btz:0.1.0/",
     /// Network magic.
     magic: u32 = message.mainnet_magic,
-    /// Whole-conversation deadline in nanoseconds. Connect and handshake take
-    /// well under a second on a reachable node, but Bitcoin Core answers
-    /// `getaddr` on a delayed relay timer, so the window must be wide enough to
-    /// catch that reply. A dead host still costs the full deadline — high
-    /// `concurrency` is what keeps those from stalling the crawl.
-    timeout_ns: u63 = 10 * std.time.ns_per_s,
+    /// Deadline for TCP connect plus the version/verack handshake. A reachable
+    /// node clears this in well under a second, so keep it tight — a dead host
+    /// costs the whole budget.
+    connect_timeout_ns: u63 = 3 * std.time.ns_per_s,
+    /// Deadline for the `addr` reply after the handshake. Bitcoin Core answers
+    /// `getaddr` on a delayed relay timer, so this is generous; the peer is
+    /// already known reachable, and a spare slot costs little.
+    getaddr_timeout_ns: u63 = 15 * std.time.ns_per_s,
     /// `addr` entries older than this many seconds are dropped rather than
     /// dialed. Bitcoin Core keeps an address ~30 days and only re-times it on
     /// reconnect, so the cutoff must be lenient.
