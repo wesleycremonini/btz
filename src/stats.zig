@@ -1,11 +1,11 @@
 //! In-memory crawl tallies and the end-of-run summary.
 //!
 //! `connect_all` calls `record` once per dial instead of writing a per-node
-//! line; `write` renders the aggregate — outcomes, client software, advertised
-//! protocol versions and advertised service flags, and discovery totals — each
-//! breakdown sorted by frequency. Fixed capacity, no allocation; a category
-//! with more distinct values than its `Tally` holds folds the rest into
-//! `overflow`.
+//! line; `write` emits the aggregate as one line of JSON — outcomes, client
+//! software, advertised protocol versions and service flags, and discovery
+//! totals. Each breakdown is a `{ "<value>": <count> }` object, most frequent
+//! first; a `Tally` that filled past capacity adds an `"(other)"` key. Fixed
+//! capacity, no allocation.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -41,19 +41,51 @@ fn Tally(comptime Key: type, comptime capacity: u32) type {
             self.len += 1;
         }
 
-        /// Print tab-separated `  <key>\t<count>` lines, most frequent first.
-        fn render(self: *Self, writer: *std.Io.Writer, comptime key_fmt: []const u8) std.Io.Writer.Error!void {
+        /// Emit `{"key":count,...}`, most frequent first. Integer keys are
+        /// stringified (JSON object keys are always strings).
+        fn write_json(self: *Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
             std.mem.sort(Entry, self.entries[0..self.len], {}, more_frequent);
+            try writer.writeByte('{');
+            var written: u32 = 0;
             for (self.entries[0..self.len]) |entry| {
-                try writer.print("  " ++ key_fmt ++ "\t{d}\n", .{ entry.key, entry.count });
+                if (written > 0) try writer.writeByte(',');
+                written += 1;
+                switch (@typeInfo(Key)) {
+                    .pointer => try write_json_string(writer, entry.key),
+                    else => {
+                        var buffer: [20]u8 = undefined;
+                        const text = std.fmt.bufPrint(&buffer, "{d}", .{entry.key}) catch unreachable;
+                        try write_json_string(writer, text);
+                    },
+                }
+                try writer.print(":{d}", .{entry.count});
             }
-            if (self.overflow > 0) try writer.print("  (+{d} with rarer values)\n", .{self.overflow});
+            if (self.overflow > 0) {
+                if (written > 0) try writer.writeByte(',');
+                try write_json_string(writer, "(other)");
+                try writer.print(":{d}", .{self.overflow});
+            }
+            try writer.writeByte('}');
         }
 
         fn more_frequent(_: void, a: Entry, b: Entry) bool {
             return a.count > b.count;
         }
     };
+}
+
+/// Write `text` as a JSON string literal, escaping what the grammar requires.
+fn write_json_string(writer: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
+    try writer.writeByte('"');
+    for (text) |byte| {
+        switch (byte) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            0...0x1f => try writer.print("\\u{x:0>4}", .{byte}),
+            else => try writer.writeByte(byte),
+        }
+    }
+    try writer.writeByte('"');
 }
 
 fn key_eql(comptime Key: type, a: Key, b: Key) bool {
@@ -101,37 +133,28 @@ pub const Stats = struct {
         }
     }
 
+    /// Emit the whole summary as one line of JSON.
     pub fn write(stats: *Stats, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         const reachable_pct: f64 = if (stats.dialed == 0) 0 else 100 *
             @as(f64, @floatFromInt(stats.ok)) / @as(f64, @floatFromInt(stats.dialed));
 
         try writer.print(
-            \\=== btz crawl summary ===
-            \\dialed     {d}
-            \\reachable  {d}  ({d:.1}%)
-            \\
-            \\failures
-            \\
-        , .{ stats.dialed, stats.ok, reachable_pct });
-        try stats.failures.render(writer, "{s}");
-
-        try writer.writeAll("\nclients (reachable)\n");
-        try stats.clients.render(writer, "{s}");
-
-        try writer.writeAll("\nprotocol versions (reachable)\n");
-        try stats.protocol_versions.render(writer, "{d}");
-
-        try writer.writeAll("\nfeatures (reachable)\n");
-        try stats.features.render(writer, "{s}");
-
+            "{{\"dialed\":{d},\"reachable\":{d},\"reachable_pct\":{d:.1},\"failures\":",
+            .{ stats.dialed, stats.ok, reachable_pct },
+        );
+        try stats.failures.write_json(writer);
+        try writer.writeAll(",\"clients\":");
+        try stats.clients.write_json(writer);
+        try writer.writeAll(",\"protocol_versions\":");
+        try stats.protocol_versions.write_json(writer);
+        try writer.writeAll(",\"features\":");
+        try stats.features.write_json(writer);
         try writer.print(
-            \\
-            \\discovery
-            \\  unique addresses found  {d}
-            \\  addresses disclosed     {d}
-            \\  peers that shared any   {d}
-            \\
-        , .{ stats.discovered, stats.addresses_disclosed, stats.peers_sharing });
+            ",\"discovery\":{{\"unique_addresses_found\":{d}," ++
+                "\"addresses_disclosed\":{d},\"peers_sharing\":{d}}}",
+            .{ stats.discovered, stats.addresses_disclosed, stats.peers_sharing },
+        );
+        try writer.writeAll("}\n");
     }
 };
 
@@ -161,11 +184,14 @@ test "record and write: outcomes, clients, versions, discovery" {
     var writer = std.Io.Writer.fixed(&buffer);
     try stats.write(&writer);
     const text = writer.buffered();
-    try testing.expect(std.mem.indexOf(u8, text, "reachable  2  (40.0%)") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "ConnectTimeout") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "Core") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "70016") != null);
-    // 0x409 = NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED, twice.
-    try testing.expect(std.mem.indexOf(u8, text, "NODE_WITNESS\t2") != null);
+    try testing.expect(text[0] == '{');
+    try testing.expect(std.mem.endsWith(u8, text, "}\n"));
+    try testing.expect(std.mem.indexOf(u8, text, "\"reachable\":2,\"reachable_pct\":40.0") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"failures\":{\"ConnectTimeout\":2,") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"clients\":{\"Core\":2}") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"protocol_versions\":{\"70016\":2}") != null);
+    // 0x409 = NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED, on two peers.
+    try testing.expect(std.mem.indexOf(u8, text, "\"NODE_WITNESS\":2") != null);
     try testing.expect(std.mem.indexOf(u8, text, "NODE_BLOOM") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"peers_sharing\":1}") != null);
 }

@@ -114,7 +114,8 @@ pub fn main(init: std.process.Init) !void {
     summary_file.writeStreamingAll(init.io, summary) catch |err| {
         log.err("write {s}: {t}", .{ config.out_path, err });
     };
-    std.debug.print("{s}", .{summary});
+    // Also to stdout, so `btz ... | jq` works; progress logs go to stderr.
+    Io.File.stdout().writeStreamingAll(init.io, summary) catch {};
 
     if (stats.ok == 0) return error.AllHandshakesFailed;
 }
