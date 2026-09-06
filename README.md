@@ -110,6 +110,24 @@ zig fmt --check .           # style check
 CI runs `zig fmt --check`, `zig build --release`, and `zig build test` on every
 push and pull request.
 
+### With Nix
+
+A [`flake.nix`](flake.nix) pins Zig `0.16.0` (via `zig-overlay`) and adds `zls`.
+Needs flakes enabled (`experimental-features = nix-command flakes` in `nix.conf`,
+or pass `--extra-experimental-features 'nix-command flakes'`).
+
+```sh
+nix develop                        # shell with the pinned zig + zls on PATH
+nix build                          # -> ./result/bin/btz
+nix run .                          # build and run
+nix run . -- --dials 2000 | jq     # args after --
+
+nix run github:wesleycremonini/btz -- --help   # no checkout needed
+```
+
+With [`direnv`](https://direnv.net): `echo 'use flake' > .envrc && direnv allow`
+drops you into the dev shell on `cd`.
+
 ## Usage
 
 ```sh

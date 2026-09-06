@@ -1,6 +1,11 @@
 .zig-cache/
 zig-out/
 
+# Nix
+result
+result-*
+.direnv/
+
 # Local agent-instruction symlinks -> AGENTS.md
 CLAUDE.md
 
