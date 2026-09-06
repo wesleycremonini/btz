@@ -10,12 +10,12 @@ const crawl = @import("crawl.zig");
 const io_uring = @import("io.zig");
 const seeds = @import("seeds.zig");
 const version = @import("version.zig");
-const PeerLog = @import("peer_log.zig").PeerLog;
+const Stats = @import("stats.zig").Stats;
 const Frontier = @import("frontier.zig").Frontier;
 const log = std.log.scoped(.main);
 
-/// The conversation narrates each step on the `.p2p` scope at `debug`; the peer
-/// record lives in the record file, so keep that scope quiet by default.
+/// The conversation narrates each step on the `.p2p` scope at `debug`; the run
+/// prints an aggregate summary, so keep that scope quiet by default.
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{
         .{ .scope = .p2p, .level = .warn },
@@ -26,12 +26,14 @@ pub const std_options: std.Options = .{
 const seed_addresses_max = 128;
 /// Addresses a single DNS-seed lookup may contribute.
 const dns_addresses_max = 64;
+/// Rendered-summary buffer. Comfortably above the widest report the fixed-size
+/// `Stats` tallies can produce.
+const summary_bytes_max = 32 * 1024;
 
 // Static storage: allocated at startup, never grown (TigerStyle). Each array is
 // sized to its compile-time ceiling in `config.zig`; a run touches only the
 // prefix its flags select, and the untouched pages cost nothing.
 var slots: [config_mod.concurrency_max]session.Peer = undefined;
-var log_lines: [4 * config_mod.concurrency_max]PeerLog.Line = undefined;
 var frontier_queue: [config_mod.frontier_capacity_max]net.IpAddress = undefined;
 var seen_table: [config_mod.seen_capacity_max]u32 = @splat(0);
 
@@ -75,14 +77,6 @@ pub fn main(init: std.process.Init) !void {
     var io: io_uring.IO = try .init(@intCast(config.ring_entries), 0);
     defer io.deinit();
 
-    var log_file = Io.Dir.cwd().createFile(init.io, config.out_path, .{}) catch |err| {
-        log.err("create {s}: {t}", .{ config.out_path, err });
-        return err;
-    };
-    defer log_file.close(init.io);
-
-    var peer_log = PeerLog.init(&io, log_file.handle, log_lines[0 .. 4 * config.concurrency]);
-
     const options: version.Options = .{
         .protocol_version = config.protocol_version,
         .services = config.services,
@@ -94,22 +88,35 @@ pub fn main(init: std.process.Init) !void {
     };
 
     // Every conversation runs on this one ring, identified by a completion
-    // pointer in its SQE `user_data`; `connect_all` returns with the ring
-    // drained, having written one record line per dialed peer as it settled.
-    const summary = crawl.connect_all(
+    // pointer in its SQE `user_data`. `connect_all` returns with the ring
+    // drained, having folded every dial's outcome into `stats`.
+    var stats: Stats = .{};
+    crawl.connect_all(
         &io,
-        &peer_log,
         &frontier,
         slots[0..config.concurrency],
+        &stats,
         config.dials,
         config.ok_target,
         options,
     );
 
-    log.info("wrote {s}: {d} ok / {d} dialed, {d} discovered, {d} record(s) dropped", .{
-        config.out_path, summary.succeeded, summary.dialed, summary.discovered, summary.dropped,
-    });
-    if (summary.succeeded == 0) return error.AllHandshakesFailed;
+    var summary_buffer: [summary_bytes_max]u8 = undefined;
+    var summary_writer = std.Io.Writer.fixed(&summary_buffer);
+    stats.write(&summary_writer) catch |err| log.err("render summary: {t}", .{err});
+    const summary = summary_writer.buffered();
+
+    var summary_file = Io.Dir.cwd().createFile(init.io, config.out_path, .{}) catch |err| {
+        log.err("create {s}: {t}", .{ config.out_path, err });
+        return err;
+    };
+    defer summary_file.close(init.io);
+    summary_file.writeStreamingAll(init.io, summary) catch |err| {
+        log.err("write {s}: {t}", .{ config.out_path, err });
+    };
+    std.debug.print("{s}", .{summary});
+
+    if (stats.ok == 0) return error.AllHandshakesFailed;
 }
 
 /// Resolve seed hostnames into `buffer` (IPv4, `port`), stopping when it fills
@@ -170,7 +177,7 @@ test {
     _ = @import("frontier.zig");
     _ = @import("connection.zig");
     _ = @import("session.zig");
-    _ = @import("peer_log.zig");
+    _ = @import("stats.zig");
     _ = @import("crawl.zig");
     _ = @import("io.zig");
     _ = @import("seeds.zig");

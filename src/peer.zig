@@ -1,8 +1,8 @@
 //! What a dial attempt produces: its `DialError` outcome and the `PeerInfo`
 //! the peer advertised about itself.
 //!
-//! A leaf module — no I/O, `std` only — so the record sink (`peer_log`) and
-//! the scheduler (`crawl`) can name these without importing the `handshake`
+//! A leaf module — no I/O, `std` only — so the summary tallies (`stats`) and
+//! the scheduler (`crawl`) can name these without importing the `session`
 //! state machine that fills them.
 
 const std = @import("std");
@@ -48,7 +48,7 @@ pub const DialError = error{
 };
 
 /// What the peer advertised in its own `version`. Filled in by the handshake,
-/// rendered into the record file by `peer_log`.
+/// aggregated into the run summary by `stats`.
 pub const PeerInfo = struct {
     protocol_version: i32,
     services: u64,
