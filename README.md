@@ -116,6 +116,18 @@ A [`flake.nix`](flake.nix) pins Zig `0.16.0` (via `zig-overlay`) and adds `zls`.
 Needs flakes enabled (`experimental-features = nix-command flakes` in `nix.conf`,
 or pass `--extra-experimental-features 'nix-command flakes'`).
 
+**From nothing — install Nix and run the crawler in one shot** (asks for your
+sudo password once):
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install --no-confirm && \
+. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh && \
+nix run --no-write-lock-file --extra-experimental-features 'nix-command flakes' \
+  github:wesleycremonini/btz -- --dials 2000 --concurrency 512
+```
+
+**With Nix already installed:**
+
 ```sh
 nix develop                        # shell with the pinned zig + zls on PATH
 nix build                          # -> ./result/bin/btz
@@ -124,6 +136,11 @@ nix run . -- --dials 2000 | jq     # args after --
 
 nix run github:wesleycremonini/btz -- --help   # no checkout needed
 ```
+
+> [!NOTE]
+> `flake.lock` is not committed yet, so `nix run github:…` needs
+> `--no-write-lock-file`. Commit one once and the flag goes away:
+> `nix flake lock && git add flake.lock && git commit -m "Add flake.lock"`.
 
 With [`direnv`](https://direnv.net): `echo 'use flake' > .envrc && direnv allow`
 drops you into the dev shell on `cd`.
