@@ -14,6 +14,7 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const net = std.Io.net;
 const io_uring = @import("io.zig");
+const client = @import("client.zig");
 const DialError = @import("peer.zig").DialError;
 const PeerInfo = @import("peer.zig").PeerInfo;
 const max_user_agent_len = @import("peer.zig").max_user_agent_len;
@@ -23,11 +24,12 @@ const log = std.log.scoped(.p2p);
 const ip_text_max = "255.255.255.255:65535".len;
 
 /// Bytes one record line can occupy. The `ok` form is the widest: address, the
-/// literal fields, a user agent in which every byte escaped to `\xNN`, and the
-/// trailing discovered-address count.
+/// literal fields, a user agent in which every byte escaped to `\xNN`, the
+/// client label, and the trailing discovered-address count.
 const line_bytes_max =
     ip_text_max + "\tok\t".len + "-2147483648".len + "\t0x".len +
     "ffffffffffffffff".len + "\t".len + 4 * max_user_agent_len +
+    "\t".len + client.label_bytes_max +
     "\t".len + "4294967295".len + "\n".len;
 
 comptime {
@@ -191,8 +193,8 @@ fn on_write_completion(context: ?*anyopaque, completion: *io_uring.Completion, r
 }
 
 /// Render one record line to `writer`, newline-terminated:
-/// `<addr>\tok\t<version>\t0x<services>\t<ua>\t<discovered>` on success, or
-/// `<addr>\tfail\t<error>` otherwise.
+/// `<addr>\tok\t<version>\t0x<services>\t<ua>\t<client>\t<discovered>` on
+/// success, or `<addr>\tfail\t<error>` otherwise.
 fn format_peer_line(
     writer: *std.Io.Writer,
     address: net.IpAddress,
@@ -203,9 +205,10 @@ fn format_peer_line(
     if (outcome) |_| {
         assert(peer != null);
         const info = peer.?;
+        const user_agent = info.user_agent();
         try writer.print("{f}\tok\t{d}\t0x{x}\t", .{ address, info.protocol_version, info.services });
-        try write_escaped(writer, info.user_agent());
-        try writer.print("\t{d}\n", .{discovered});
+        try write_escaped(writer, user_agent);
+        try writer.print("\t{s}\t{d}\n", .{ client.classify(user_agent).label(), discovered });
     } else |err| {
         try writer.print("{f}\tfail\t{s}\n", .{ address, @errorName(err) });
     }
@@ -246,7 +249,7 @@ test "format_peer_line: ok record is one escaped tab-separated line" {
     const address: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 1, 2, 3, 4 }, .port = 8333 } };
     try format_peer_line(&writer, address, {}, &peer, 42);
     try std.testing.expectEqualStrings(
-        "1.2.3.4:8333\tok\t70016\t0x409\t/Satoshi:27.0.0/\\x09/evil/\t42\n",
+        "1.2.3.4:8333\tok\t70016\t0x409\t/Satoshi:27.0.0/\\x09/evil/\tCore\t42\n",
         writer.buffered(),
     );
 }
