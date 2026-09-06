@@ -1,7 +1,7 @@
 //! In-memory crawl tallies and the end-of-run summary.
 //!
 //! `connect_all` calls `record` once per dial instead of writing a per-node
-//! line; `write` emits the aggregate as one line of JSON — outcomes, client
+//! line; `write` emits the aggregate as pretty-printed JSON — outcomes, client
 //! software, advertised protocol versions and service flags, and discovery
 //! totals. Each breakdown is a `{ "<value>": <count> }` object, most frequent
 //! first; a `Tally` that filled past capacity adds an `"(other)"` key. Fixed
@@ -41,15 +41,23 @@ fn Tally(comptime Key: type, comptime capacity: u32) type {
             self.len += 1;
         }
 
-        /// Emit `{"key":count,...}`, most frequent first. Integer keys are
-        /// stringified (JSON object keys are always strings).
-        fn write_json(self: *Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        /// Emit a JSON object, one `  "key": count` per line at `entry_indent`
+        /// spaces, most frequent first (`{}` when empty). Integer keys are
+        /// stringified — JSON object keys are always strings.
+        fn write_json(self: *Self, writer: *std.Io.Writer, entry_indent: usize) std.Io.Writer.Error!void {
             std.mem.sort(Entry, self.entries[0..self.len], {}, more_frequent);
-            try writer.writeByte('{');
+            assert(entry_indent >= 2);
+            if (self.len == 0 and self.overflow == 0) {
+                try writer.writeAll("{}");
+                return;
+            }
+
+            try writer.writeAll("{\n");
             var written: u32 = 0;
             for (self.entries[0..self.len]) |entry| {
-                if (written > 0) try writer.writeByte(',');
+                if (written > 0) try writer.writeAll(",\n");
                 written += 1;
+                try writer.splatByteAll(' ', entry_indent);
                 switch (@typeInfo(Key)) {
                     .pointer => try write_json_string(writer, entry.key),
                     else => {
@@ -58,13 +66,16 @@ fn Tally(comptime Key: type, comptime capacity: u32) type {
                         try write_json_string(writer, text);
                     },
                 }
-                try writer.print(":{d}", .{entry.count});
+                try writer.print(": {d}", .{entry.count});
             }
             if (self.overflow > 0) {
-                if (written > 0) try writer.writeByte(',');
+                if (written > 0) try writer.writeAll(",\n");
+                try writer.splatByteAll(' ', entry_indent);
                 try write_json_string(writer, "(other)");
-                try writer.print(":{d}", .{self.overflow});
+                try writer.print(": {d}", .{self.overflow});
             }
+            try writer.writeByte('\n');
+            try writer.splatByteAll(' ', entry_indent - 2);
             try writer.writeByte('}');
         }
 
@@ -133,28 +144,35 @@ pub const Stats = struct {
         }
     }
 
-    /// Emit the whole summary as one line of JSON.
+    /// Emit the whole summary as pretty-printed JSON (2-space indent).
     pub fn write(stats: *Stats, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         const reachable_pct: f64 = if (stats.dialed == 0) 0 else 100 *
             @as(f64, @floatFromInt(stats.ok)) / @as(f64, @floatFromInt(stats.dialed));
 
         try writer.print(
-            "{{\"dialed\":{d},\"reachable\":{d},\"reachable_pct\":{d:.1},\"failures\":",
+            "{{\n" ++
+                "  \"dialed\": {d},\n" ++
+                "  \"reachable\": {d},\n" ++
+                "  \"reachable_pct\": {d:.1},\n" ++
+                "  \"failures\": ",
             .{ stats.dialed, stats.ok, reachable_pct },
         );
-        try stats.failures.write_json(writer);
-        try writer.writeAll(",\"clients\":");
-        try stats.clients.write_json(writer);
-        try writer.writeAll(",\"protocol_versions\":");
-        try stats.protocol_versions.write_json(writer);
-        try writer.writeAll(",\"features\":");
-        try stats.features.write_json(writer);
+        try stats.failures.write_json(writer, 4);
+        try writer.writeAll(",\n  \"clients\": ");
+        try stats.clients.write_json(writer, 4);
+        try writer.writeAll(",\n  \"protocol_versions\": ");
+        try stats.protocol_versions.write_json(writer, 4);
+        try writer.writeAll(",\n  \"features\": ");
+        try stats.features.write_json(writer, 4);
         try writer.print(
-            ",\"discovery\":{{\"unique_addresses_found\":{d}," ++
-                "\"addresses_disclosed\":{d},\"peers_sharing\":{d}}}",
+            ",\n  \"discovery\": {{\n" ++
+                "    \"unique_addresses_found\": {d},\n" ++
+                "    \"addresses_disclosed\": {d},\n" ++
+                "    \"peers_sharing\": {d}\n" ++
+                "  }}\n" ++
+                "}}\n",
             .{ stats.discovered, stats.addresses_disclosed, stats.peers_sharing },
         );
-        try writer.writeAll("}\n");
     }
 };
 
@@ -184,14 +202,15 @@ test "record and write: outcomes, clients, versions, discovery" {
     var writer = std.Io.Writer.fixed(&buffer);
     try stats.write(&writer);
     const text = writer.buffered();
-    try testing.expect(text[0] == '{');
+    try testing.expect(std.mem.startsWith(u8, text, "{\n"));
     try testing.expect(std.mem.endsWith(u8, text, "}\n"));
-    try testing.expect(std.mem.indexOf(u8, text, "\"reachable\":2,\"reachable_pct\":40.0") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "\"failures\":{\"ConnectTimeout\":2,") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "\"clients\":{\"Core\":2}") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "\"protocol_versions\":{\"70016\":2}") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "  \"reachable\": 2,\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "  \"reachable_pct\": 40.0,\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"failures\": {\n    \"ConnectTimeout\": 2") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"clients\": {\n    \"Core\": 2\n  }") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"protocol_versions\": {\n    \"70016\": 2\n  }") != null);
     // 0x409 = NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED, on two peers.
-    try testing.expect(std.mem.indexOf(u8, text, "\"NODE_WITNESS\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "    \"NODE_WITNESS\": 2") != null);
     try testing.expect(std.mem.indexOf(u8, text, "NODE_BLOOM") == null);
-    try testing.expect(std.mem.indexOf(u8, text, "\"peers_sharing\":1}") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "    \"peers_sharing\": 1\n") != null);
 }
