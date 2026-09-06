@@ -122,8 +122,7 @@ sudo password once):
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install --no-confirm && \
 . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh && \
-nix run --no-write-lock-file --extra-experimental-features 'nix-command flakes' \
-  github:wesleycremonini/btz -- --dials 2000 --concurrency 512
+nix run github:wesleycremonini/btz -- --dials 2000 --concurrency 512
 ```
 
 **With Nix already installed:**
@@ -136,11 +135,6 @@ nix run . -- --dials 2000 | jq     # args after --
 
 nix run github:wesleycremonini/btz -- --help   # no checkout needed
 ```
-
-> [!NOTE]
-> `flake.lock` is not committed yet, so `nix run github:…` needs
-> `--no-write-lock-file`. Commit one once and the flag goes away:
-> `nix flake lock && git add flake.lock && git commit -m "Add flake.lock"`.
 
 With [`direnv`](https://direnv.net): `echo 'use flake' > .envrc && direnv allow`
 drops you into the dev shell on `cd`.
