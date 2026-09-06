@@ -2,9 +2,10 @@
 //!
 //! `connect_all` calls `record` once per dial instead of writing a per-node
 //! line; `write` renders the aggregate — outcomes, client software, advertised
-//! protocol versions and service bits, and discovery totals — each breakdown
-//! sorted by frequency. Fixed capacity, no allocation; a category with more
-//! distinct values than its `Tally` holds folds the rest into `overflow`.
+//! protocol versions and advertised service flags, and discovery totals — each
+//! breakdown sorted by frequency. Fixed capacity, no allocation; a category
+//! with more distinct values than its `Tally` holds folds the rest into
+//! `overflow`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -12,6 +13,7 @@ const assert = std.debug.assert;
 const DialError = @import("peer.zig").DialError;
 const PeerInfo = @import("peer.zig").PeerInfo;
 const client = @import("client.zig");
+const services = @import("services.zig");
 
 /// A small fixed-capacity frequency map. `Key` is `[]const u8` or an integer.
 fn Tally(comptime Key: type, comptime capacity: u32) type {
@@ -76,7 +78,8 @@ pub const Stats = struct {
     failures: Tally([]const u8, 24) = .{},
     clients: Tally([]const u8, 16) = .{},
     protocol_versions: Tally(i32, 24) = .{},
-    service_bits: Tally(u64, 64) = .{},
+    /// One count per advertised service flag — a peer bumps every flag it sets.
+    features: Tally([]const u8, services.known.len + 4) = .{},
 
     /// Fold one dial's outcome into the tallies. `peer` is read only on success.
     pub fn record(stats: *Stats, outcome: DialError!void, peer: ?*const PeerInfo, disclosed: u32) void {
@@ -87,7 +90,10 @@ pub const Stats = struct {
             stats.ok += 1;
             stats.clients.bump(client.classify(info.user_agent()).label());
             stats.protocol_versions.bump(info.protocol_version);
-            stats.service_bits.bump(info.services);
+            inline for (services.known) |flag| {
+                if (services.is_set(info.services, flag.bit)) stats.features.bump(flag.name);
+            }
+            if (services.has_other(info.services)) stats.features.bump(services.other_label);
             stats.addresses_disclosed += disclosed;
             if (disclosed > 0) stats.peers_sharing += 1;
         } else |err| {
@@ -115,8 +121,8 @@ pub const Stats = struct {
         try writer.writeAll("\nprotocol versions (reachable)\n");
         try stats.protocol_versions.render(writer, "{d}");
 
-        try writer.writeAll("\nservice bits (reachable)\n");
-        try stats.service_bits.render(writer, "0x{x}");
+        try writer.writeAll("\nfeatures (reachable)\n");
+        try stats.features.render(writer, "{s}");
 
         try writer.print(
             \\
@@ -159,4 +165,7 @@ test "record and write: outcomes, clients, versions, discovery" {
     try testing.expect(std.mem.indexOf(u8, text, "ConnectTimeout") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Core") != null);
     try testing.expect(std.mem.indexOf(u8, text, "70016") != null);
+    // 0x409 = NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED, twice.
+    try testing.expect(std.mem.indexOf(u8, text, "NODE_WITNESS\t2") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "NODE_BLOOM") == null);
 }

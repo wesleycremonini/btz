@@ -172,6 +172,7 @@ test {
     _ = @import("version.zig");
     _ = @import("peer.zig");
     _ = @import("client.zig");
+    _ = @import("services.zig");
     _ = @import("config.zig");
     _ = @import("addr.zig");
     _ = @import("frontier.zig");
